@@ -55,6 +55,10 @@ You can configure the add-on in two ways.
   [General Configuration](../configuration.md#general-configuration)), and the
   [PID Controller](../configuration.md#pid-controller). Leave them empty to keep
   them off.
+- Using a Marstek Venus E Mini? Pick `ct003`, and optionally set
+  `Battery Power Sensors` to a sensor that measures the mini's power, such as a
+  smart plug in front of it: `ccc837b39dbe=sensor.mini_plug_power@A`. See
+  [Venus E Mini](../ct002.md#venus-e-mini-vnsem).
 - Click "Save" to apply the configuration
 
 ### B) Using a custom configuration file (advanced)

@@ -76,6 +76,12 @@ DashboardComponent = dashboard_ns.class_("DashboardComponent", cg.Component)
 
 # Parent fields
 CONF_POWER_SENSOR_L1 = "power_sensor_l1"
+# TEST PATCH: per-battery power sensors (Venus E Mini).
+CONF_BATTERY_POWER_SENSORS = "battery_power_sensors"
+CONF_BATTERY_MAC = "mac"
+CONF_BATTERY_SENSOR = "sensor"
+CONF_BATTERY_PHASE = "phase"
+CONF_BATTERY_INVERT = "invert"
 CONF_POWER_SENSOR_L2 = "power_sensor_l2"
 CONF_POWER_SENSOR_L3 = "power_sensor_l3"
 CONF_CT_TYPE = "ct_type"
@@ -461,6 +467,26 @@ def _validate_three_phase_sensors(config):
             f"or both be omitted (got l2={has_l2}, l3={has_l3})"
         )
     return config
+
+
+def _validate_battery_mac(value: str) -> str:
+    """TEST PATCH: a battery MAC as the battery sends it (12 hex, lowercase)."""
+    stripped = cv.string_strict(value).replace(":", "").replace("-", "").lower()
+    if len(stripped) != 12 or any(c not in "0123456789abcdef" for c in stripped):
+        raise cv.Invalid(f"battery mac must be 12 hex characters; got {value!r}")
+    return stripped
+
+
+BATTERY_POWER_SENSOR_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_BATTERY_MAC): _validate_battery_mac,
+        cv.Required(CONF_BATTERY_SENSOR): cv.use_id(sensor.Sensor),
+        cv.Optional(CONF_BATTERY_PHASE, default="A"): cv.one_of(
+            "A", "B", "C", "D", upper=True
+        ),
+        cv.Optional(CONF_BATTERY_INVERT, default=False): cv.boolean,
+    }
+)
 
 
 def _validate_ct_mac(value: str) -> str:
@@ -986,6 +1012,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_POWER_SENSOR_L1): cv.use_id(sensor.Sensor),
             cv.Optional(CONF_POWER_SENSOR_L2): cv.use_id(sensor.Sensor),
             cv.Optional(CONF_POWER_SENSOR_L3): cv.use_id(sensor.Sensor),
+            cv.Optional(CONF_BATTERY_POWER_SENSORS, default=[]): cv.ensure_list(
+                BATTERY_POWER_SENSOR_SCHEMA
+            ),
             cv.Optional(CONF_CT_TYPE, default="HME-4"): cv.one_of(
                 "HME-4", "HME-3", upper=True
             ),
@@ -1040,6 +1069,17 @@ async def to_code(config):
         sensor_l3 = await cg.get_variable(config[CONF_POWER_SENSOR_L3])
         cg.add(var.set_power_sensor_l2(sensor_l2))
         cg.add(var.set_power_sensor_l3(sensor_l3))
+
+    for battery in config[CONF_BATTERY_POWER_SENSORS]:
+        battery_sensor = await cg.get_variable(battery[CONF_BATTERY_SENSOR])
+        cg.add(
+            var.add_battery_power_sensor(
+                battery[CONF_BATTERY_MAC],
+                battery_sensor,
+                battery[CONF_BATTERY_PHASE],
+                battery[CONF_BATTERY_INVERT],
+            )
+        )
 
     # Unit → watts conversion (issue #572). A declared power unit yields a
     # per-phase scale; declaring any unit (even W) also disables the runtime

@@ -98,6 +98,31 @@ ASCII wire field.
 - The `participate` flag (field 7) is an additional, explicit gate: even a fully phase‑committed reporter
   is **excluded from aggregation** when it sends `0`.
 
+### Venus E Mini (`VNSEM-0`) requests
+
+The mini never leaves the `'0'` bucket, and field 6 is not power:
+
+| Field | Venus E 2.0/3.0 | Venus E Mini |
+|---|---|---|
+| 4 `hhm_mac_code` | the bound CT MAC | always `000000000000`, also once paired |
+| 5 `phase` | `A`/`B`/`C` once detected | always `0` |
+| 6 `phase_power` | its power in watts | a status: `1` working, `0` idle |
+
+Observed example: `VNSEM-0|ccc837b39dbe|HME-3|000000000000|0|1`.
+
+A real CT003 (`HME-3` v122) does not count `'0'` reporters in any `*_chrg_nb`.
+It adds their field 6 into the `x_chrg_power` / `x_dchrg_power` sums, so with
+minis those two fields carry the **number of working minis**, not watts. A
+mini divides the grid value it receives by that number and steers on the
+result. That is how several minis share one CT003: each takes 1/N.
+
+AstraMeter does the same for minis alone. Next to batteries that report their
+power, it puts the size of the whole pool in `x_dchrg_power` instead, so each
+mini takes 1/N of the grid and the balancer spreads the rest. A mini with a
+battery power sensor gets `x_chrg_power = 0` and `x_dchrg_power = 1`, so it
+applies its own target in full. See
+[Venus E Mini](ct002.md#venus-e-mini-vnsem).
+
 ### When a battery sends `participate = 0`
 
 The flag lets a battery opt out of being counted by the CT. The Venus class
@@ -636,6 +661,11 @@ Additional options refine the control:
 - **Saturation detection** — Reduces share for batteries that cannot follow target (e.g. full or empty).
 - **Error boost** — Increases correction gain when offset is large for faster convergence.
 - **Error reduce** — Decreases correction gain when offset is small to avoid oscillation.
+
+- **Venus E Mini** — A mini reports no power, so the balancer can't steer it. Without a
+  battery power sensor it takes 1/N of the grid, never shown a value that would make it
+  charge from another battery, and paced. With one it is steered like the rest. See
+  [Venus E Mini](ct002.md#venus-e-mini-vnsem).
 
 In this mode, the emulator computes what each battery should do; the batteries follow the targets.
 

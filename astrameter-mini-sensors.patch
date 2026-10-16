@@ -1,0 +1,2100 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index aecd828..f793506 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## Next
+ 
++- **Added** steering for the Marstek Venus E Mini next to other batteries. A mini without a sensor takes an equal share of the grid; it is never steered against another battery, so they can't charge each other, and it is paced so it doesn't run ahead of a slower Venus. Several minis keep sharing the way they do on a real CT003. See [Venus E Mini](docs/ct002.md#venus-e-mini-vnsem).
++
++- **Added** `BATTERY_POWER_SENSORS` (add-on: **Battery Power Sensors**; ESPHome: `battery_power_sensors`) for batteries that don't report their own power, such as the Venus E Mini. Give it a smart plug in front of the battery, a Home Assistant sensor or any other power source, and the battery is steered like any other, with fair distribution and saturation detection. See [Battery power sensors](docs/ct002.md#battery-power-sensors).
++
+ - **Fixed** a Marstek Venus E Mini failing to pair with the emulated CT ("configuration failed" in the app) when `CT_MAC` is set, and a `CT_MAC` entered in uppercase or with colons never pairing ([#727](https://github.com/tomquist/astrameter/pull/727), [#728](https://github.com/tomquist/astrameter/pull/728)).
+ 
+ - **Fixed** a battery's Home Assistant entities staying unavailable until a restart since 2.3.1, after a network hiccup briefly dropped the battery and the MQTT connection at the same time ([#718](https://github.com/tomquist/astrameter/issues/718), [#719](https://github.com/tomquist/astrameter/pull/719)).
+diff --git a/config.ini.example b/config.ini.example
+index f6d5ab8..0d2dde8 100644
+--- a/config.ini.example
++++ b/config.ini.example
+@@ -113,6 +113,16 @@ THROTTLE_INTERVAL = 0
+ ## charges them. 0 disables it (default); 0-10000. Adjustable live from the
+ ## dashboard or Home Assistant. Needs ACTIVE_CONTROL.
+ # PEAKSHAVING_THRESHOLD = 0
++## --- Batteries that don't report their power (Venus E Mini) ---
++## A Venus E Mini reports neither its phase nor its power. Without a sensor it
++## takes an equal share (1/N) of the grid. With one it is steered like any other
++## battery. Format: <battery mac>=[-]<source>[@A|B|C|D], comma separated.
++## <source> is a section below (with a SOURCE key) or a Home Assistant entity.
++## The source counts charging as positive; "-" flips that. Phase defaults to A.
++# BATTERY_POWER_SENSORS = ccc837b39dbe=BATTERY_MINI_PLUG@A, aabbccddeeff=sensor.mini2_power
++## Only for Home Assistant entities, and only when not running as the add-on:
++# BATTERY_SENSORS_HA_URL = http://192.168.1.10:8123
++# BATTERY_SENSORS_HA_TOKEN = <long-lived access token>
+ 
+ ## --- Fair distribution (multi-battery balancing) ---
+ ## Adjust each battery's target so they share the load evenly.
+@@ -628,3 +638,12 @@ THROTTLE_INTERVAL = 0
+ ## Each configured powermeter section gets an "AstraMeter Powermeter <section>" device with an
+ ## Online binary sensor that flips off when the source stops delivering fresh/usable readings.
+ # POWERMETER_HEALTH_INTERVAL = 30
++
++## --- Battery power source (for BATTERY_POWER_SENSORS) ---
++## SOURCE names a power meter type; the other keys are that type's usual keys.
++## The section name must NOT start with a meter type (SHELLY_..., TASMOTA_...),
++## or it would also be read as a grid meter.
++#[BATTERY_MINI_PLUG]
++#SOURCE = JSON_HTTP
++#URL = http://192.168.1.50/api/v1/data
++#JSON_PATHS = $.active_power_w
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 0f42a73..26c55e5 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -15,7 +15,9 @@ that apply to the whole app and to every powermeter. For one specific area, see:
+ - **[Powermeter sources](powermeters.md)** — the `config.ini` section for each
+   supported meter (Shelly, Tasmota, MQTT, Home Assistant, SMA, HomeWizard, …).
+ - **[CT002 / CT003 steering](ct002.md)** — the CT emulator, active control,
+-  multi-battery balancing, and efficiency optimization.
++  multi-battery balancing, and efficiency optimization, including the
++  [Venus E Mini](ct002.md#venus-e-mini-vnsem) and
++  [battery power sensors](ct002.md#battery-power-sensors).
+ - **[MQTT Insights & Home Assistant entities](mqtt-insights.md)** — publishing
+   internal state to MQTT, HA Device Discovery, and per-battery controls.
+ - **[ESPHome powermeter sources](esphome-powermeters.md)** — the equivalent
+diff --git a/docs/ct002-ct003-protocol.md b/docs/ct002-ct003-protocol.md
+index 4b531d1..e438077 100644
+--- a/docs/ct002-ct003-protocol.md
++++ b/docs/ct002-ct003-protocol.md
+@@ -98,6 +98,31 @@ ASCII wire field.
+ - The `participate` flag (field 7) is an additional, explicit gate: even a fully phase‑committed reporter
+   is **excluded from aggregation** when it sends `0`.
+ 
++### Venus E Mini (`VNSEM-0`) requests
++
++The mini never leaves the `'0'` bucket, and field 6 is not power:
++
++| Field | Venus E 2.0/3.0 | Venus E Mini |
++|---|---|---|
++| 4 `hhm_mac_code` | the bound CT MAC | always `000000000000`, also once paired |
++| 5 `phase` | `A`/`B`/`C` once detected | always `0` |
++| 6 `phase_power` | its power in watts | a status: `1` working, `0` idle |
++
++Observed example: `VNSEM-0|ccc837b39dbe|HME-3|000000000000|0|1`.
++
++A real CT003 (`HME-3` v122) does not count `'0'` reporters in any `*_chrg_nb`.
++It adds their field 6 into the `x_chrg_power` / `x_dchrg_power` sums, so with
++minis those two fields carry the **number of working minis**, not watts. A
++mini divides the grid value it receives by that number and steers on the
++result. That is how several minis share one CT003: each takes 1/N.
++
++AstraMeter does the same for minis alone. Next to batteries that report their
++power, it puts the size of the whole pool in `x_dchrg_power` instead, so each
++mini takes 1/N of the grid and the balancer spreads the rest. A mini with a
++battery power sensor gets `x_chrg_power = 0` and `x_dchrg_power = 1`, so it
++applies its own target in full. See
++[Venus E Mini](ct002.md#venus-e-mini-vnsem).
++
+ ### When a battery sends `participate = 0`
+ 
+ The flag lets a battery opt out of being counted by the CT. The Venus class
+@@ -637,6 +662,11 @@ Additional options refine the control:
+ - **Error boost** — Increases correction gain when offset is large for faster convergence.
+ - **Error reduce** — Decreases correction gain when offset is small to avoid oscillation.
+ 
++- **Venus E Mini** — A mini reports no power, so the balancer can't steer it. Without a
++  battery power sensor it takes 1/N of the grid, never shown a value that would make it
++  charge from another battery, and paced. With one it is steered like the rest. See
++  [Venus E Mini](ct002.md#venus-e-mini-vnsem).
++
+ In this mode, the emulator computes what each battery should do; the batteries follow the targets.
+ 
+ ## MQTT runtime‑info frame
+diff --git a/docs/ct002.md b/docs/ct002.md
+index 5ea0435..d1f33ff 100644
+--- a/docs/ct002.md
++++ b/docs/ct002.md
+@@ -34,6 +34,10 @@ DEDUPE_TIME_WINDOW = 0
+ CONSUMER_TTL = 120
+ ```
+ 
++> **Venus E Mini?** Read [Venus E Mini (VNSEM)](#venus-e-mini-vnsem): it
++> needs `ct003`, shows as *unassigned* and, optionally, a
++> [battery power sensor](#battery-power-sensors).
++
+ ## Active steering, balancing & efficiency
+ 
+ All keys in this section go under the `[CT002]` or `[CT003]` section. They are
+@@ -264,6 +268,134 @@ the pack is full, empty, or capped below what the house needs. The score still
+ reflects tracking accuracy in that state, so alert on the verdict rather than on
+ the score alone.
+ 
++## Venus E Mini (VNSEM)
++
++The Venus E Mini talks to the CT a little differently from a Venus E 2.0 or 3.0:
++
++- It always asks for the CT as `000000000000`, even once it is paired, and
++  pairs only when the answer carries the CT's own MAC. AstraMeter answers it
++  that way, also with `CT_MAC` set.
++- It never reports a phase (always phase `0`), so the dashboard shows it as
++  *unassigned*. That is normal for a mini, also on a real CT003.
++- Instead of its power it reports a status: `1` while it is working, `0` while
++  idle.
++- It steers itself on the grid value it receives, divided by the number of
++  batteries the CT tells it share the grid.
++
++Use `DEVICE_TYPE = ct003` with a mini: it expects the CT003's 28-field answer.
++
++### How AstraMeter steers a mini
++
++| Setup | What the mini does |
++|---|---|
++| Only minis, no sensors | Exactly what a real CT003 does: every working mini takes an equal share (1/N) of the grid. |
++| Minis next to a Venus (or another battery that reports its power) | Each mini without a sensor takes 1/N of the grid, where N counts all batteries. The balancer spreads the rest over the batteries it can measure. |
++| A mini with a [battery power sensor](#battery-power-sensors) | Steered like a Venus: it gets its own target on its configured phase, with fair distribution, weights, pacing and saturation detection. |
++| Any mix of the above | Each mini follows its own row. Minis with a sensor count as measured batteries. |
++
++A mini without a sensor is invisible to the balancer, so next to a Venus
++AstraMeter adds two safeguards:
++
++- **No cross-charging.** The mini is never shown export while every measured
++  battery is discharging, nor import while they are all charging. Without this,
++  the mini could charge from the Venus, or the other way round.
++- **Paced.** The value it receives changes by at most 300 W × N per answer, so
++  it doesn't jump ahead of a Venus that ramps more slowly.
++
++Its limits:
++
++- Fair distribution, distribution weights and minimum-efficient-power can't
++  include it, since its power is unknown.
++- AstraMeter can't see when it is full or empty. An empty mini keeps its 1/N.
++  That part of the grid stays uncovered at first, and the other batteries take
++  it over in the following seconds, more slowly than when a battery's
++  saturation is detected.
++
++A battery power sensor removes all of these limits.
++
++## Battery power sensors
++
++A battery power sensor tells AstraMeter what a battery that doesn't report its
++power is actually doing. A smart plug in front of the battery (a HomeWizard
++Energy Socket, a Shelly Plug, …), a Home Assistant sensor, or anything else
++AstraMeter can read as a power meter will do. With one, the battery is steered
++like any other. When the sensor gives no reading for 5 seconds, the battery
++falls back to the behaviour it has without one.
++
++Requirements:
++
++- It reports watts and updates about once a second. Slower readings make the
++  balancing lag behind.
++- It counts power the battery **draws** (charging) as positive, which is how a
++  plug in front of the battery measures it. If yours counts discharging as
++  positive, put a `-` before the source.
++- It needs `ACTIVE_CONTROL` (the default).
++
++### config.ini
++
++Under `[CT003]` (or `[CT002]`):
++
++- **BATTERY_POWER_SENSORS** — `<battery mac>=[-]<source>[@<phase>]`, comma
++  separated, one entry per battery.
++  - `<battery mac>` is the MAC the battery polls with (12 hex digits, colons
++    allowed). It is shown on the dashboard and in the log.
++  - `<source>` is either the name of a section in the same file, or a Home
++    Assistant entity id (anything with a dot, such as `sensor.mini_power`).
++  - `<phase>` is `A`, `B`, `C` or `D` (combined): the phase the battery is
++    steered on, since a mini reports none. Default `A`.
++- **BATTERY_SENSORS_HA_URL** / **BATTERY_SENSORS_HA_TOKEN** — where to read Home
++  Assistant entities from (URL such as `http://192.168.1.10:8123`, and a
++  long-lived access token). Not needed inside the Home Assistant add-on, which
++  reads them through the Supervisor.
++
++A source section has a `SOURCE` key naming a power meter type (`JSON_HTTP`,
++`SHELLY`, `TASMOTA`, `MQTT`, `HOMEASSISTANT`, `HOMEWIZARD`, …), plus that
++type's usual keys from [Powermeter sources](powermeters.md). Its name must not
++start with a meter type (`SHELLY_…`, `TASMOTA_…`), otherwise it would also be
++read as a grid meter.
++
++```ini
++[CT003]
++BATTERY_POWER_SENSORS = ccc837b39dbe=BATTERY_MINI_PLUG@A, aabbccddeeff=sensor.mini2_power@B
++# Only for the Home Assistant entity, outside the add-on:
++BATTERY_SENSORS_HA_URL = http://192.168.1.10:8123
++BATTERY_SENSORS_HA_TOKEN = <long-lived access token>
++
++# A HomeWizard Energy Socket in front of the first mini (Local API enabled).
++[BATTERY_MINI_PLUG]
++SOURCE = JSON_HTTP
++URL = http://192.168.1.50/api/v1/data
++JSON_PATHS = $.active_power_w
++```
++
++A Shelly plug works the same way:
++
++```ini
++[BATTERY_MINI_SHELLY]
++SOURCE = SHELLY
++TYPE = PLUGS
++IP = 192.168.1.51
++```
++
++### Home Assistant add-on
++
++Set **Battery Power Sensors** on the Configuration tab, using entities only:
++`ccc837b39dbe=sensor.mini_plug_power@A`. Several minis go comma separated.
++For a section source, use a custom config file instead.
++
++### ESPHome
++
++Any ESPHome sensor works, so the ESP32 needs no Home Assistant for it. See
++[installation/esphome.md](installation/esphome.md#battery-power-sensors).
++
++### Checking it works
++
++At startup the log shows `Battery <mac>: reading its power from <source>`,
++followed by `power from <source> is live` once the first reading arrives. On the
++dashboard the mini then gets a phase and a real power instead of *unassigned*.
++If the source fails, the log says `<source> unusable (...)` and the mini falls
++back to 1/N.
++
+ ## Marstek cloud auto-registration
+ 
+ Optional. Auto-create/check managed fake CT device(s) at startup so the Marstek
+diff --git a/docs/faq.md b/docs/faq.md
+index 5e3cbd0..2f456c2 100644
+--- a/docs/faq.md
++++ b/docs/faq.md
+@@ -117,6 +117,22 @@ A: Use one of these device types:
+ A: No, this project is Marstek-specific. For other brands, see
+ [uni-meter](https://github.com/sdeigm/uni-meter).
+ 
++### Can I combine a Venus E Mini with a Venus E 2.0 or 3.0?
++
++Yes, with `DEVICE_TYPE = ct003`. A real CT003 can steer several minis or
++several Venus batteries, but it doesn't balance a mini against a Venus. The
++mini reports no power, so the CT can't tell what it is doing. AstraMeter gives
++a mini without a sensor 1/N of the grid and makes sure it never charges from
++the Venus, or the Venus from it. For proper balancing, put a smart plug in front
++of the mini and add it as a battery power sensor. See
++[Venus E Mini](ct002.md#venus-e-mini-vnsem).
++
++### My Venus E Mini shows as "unassigned". Is that a problem?
++
++No. A mini never reports a phase, also not to a real CT003. With a
++[battery power sensor](ct002.md#battery-power-sensors) it is shown on the phase
++you configure for it.
++
+ ## Troubleshooting
+ 
+ ### I get permission errors when binding to port 1010/2220.
+diff --git a/docs/installation/esphome.md b/docs/installation/esphome.md
+index cd5026d..d1ac353 100644
+--- a/docs/installation/esphome.md
++++ b/docs/installation/esphome.md
+@@ -70,6 +70,84 @@ Optional sub-blocks nest under the same `ct002:` key:
+   `http_request:` block. Add `mqtt_insights:` too and the App-topic subscription
+   picks up the MAC on its own — no reboot needed.
+ 
++## Venus E Mini
++
++Set `ct_type: HME-3` (CT003) when a Venus E Mini polls the ESP32: it expects
++the CT003's 28-field answer. It works without anything else, the same way it
++does with AstraMeter on a server. Without a sensor a mini takes 1/N of the
++grid, never steered against another battery and paced. See
++[Venus E Mini](../ct002.md#venus-e-mini-vnsem).
++
++### Battery power sensors
++
++Give a mini a sensor that measures its power and it is steered like any other
++battery. Any ESPHome sensor works, so no Home Assistant is needed: an
++`http_request` poll of a smart plug, an `mqtt_subscribe` sensor, a
++`homeassistant` sensor, or a power-metering chip wired to the ESP32 itself.
++
++```yaml
++ct002:
++  power_sensor_l1: grid_l1
++  ct_type: HME-3
++  battery_power_sensors:
++    - mac: ccc837b39dbe       # the mini's MAC as it polls the CT
++      sensor: mini_power      # positive while the mini charges
++      phase: A                # optional, default A
++      invert: false           # optional: true if discharge is positive
++    - mac: aabbccddeeff       # a second mini, one entry each
++      sensor: mini2_power
++```
++
++| Key | Required | Meaning |
++|---|---|---|
++| `mac` | yes | The battery's MAC, 12 hex digits (colons allowed). |
++| `sensor` | yes | An ESPHome sensor in watts. Charging counts as positive. |
++| `phase` | no | `A`, `B`, `C` or `D` (combined): the phase it is steered on. Default `A`. |
++| `invert` | no | `true` if the sensor counts discharging as positive. Default `false`. |
++
++The sensor should update about once a second. A reading older than 5 s is
++ignored, and the mini falls back to 1/N until fresh readings return. A sensor
++that goes `NaN` (unavailable) counts as no reading.
++
++Example: a HomeWizard Energy Socket in front of the mini (Local API enabled),
++polled every second:
++
++```yaml
++http_request:
++  timeout: 2s
++
++sensor:
++  - platform: template
++    id: mini_power
++    unit_of_measurement: W
++    update_interval: never
++
++interval:
++  - interval: 1s
++    then:
++      - http_request.get:
++          url: http://192.168.1.50/api/v1/data
++          capture_response: true
++          max_response_buffer_size: 1024
++          on_response:
++            then:
++              - lambda: |-
++                  json::parse_json(body, [](JsonObject root) -> bool {
++                    id(mini_power).publish_state(root["active_power_w"].as<float>());
++                    return true;
++                  });
++```
++
++Or from an MQTT topic (the `mqtt:` block must be configured):
++
++```yaml
++sensor:
++  - platform: mqtt_subscribe
++    id: mini_power
++    topic: plugs/mini/power
++    unit_of_measurement: W
++```
++
+ ## Status & requirements
+ 
+ **Status:** experimental — the UDP emulator, balancer, filter pipeline,
+diff --git a/docs/installation/home-assistant.md b/docs/installation/home-assistant.md
+index 4c0a004..986946e 100644
+--- a/docs/installation/home-assistant.md
++++ b/docs/installation/home-assistant.md
+@@ -55,6 +55,10 @@ You can configure the add-on in two ways.
+   [General Configuration](../configuration.md#general-configuration)), and the
+   [PID Controller](../configuration.md#pid-controller). Leave them empty to keep
+   them off.
++- Using a Marstek Venus E Mini? Pick `ct003`, and optionally set
++  `Battery Power Sensors` to a sensor that measures the mini's power, such as a
++  smart plug in front of it: `ccc837b39dbe=sensor.mini_plug_power@A`. See
++  [Venus E Mini](../ct002.md#venus-e-mini-vnsem).
+ - Click "Save" to apply the configuration
+ 
+ ### B) Using a custom configuration file (advanced)
+diff --git a/esphome.example.yaml b/esphome.example.yaml
+index af1f181..043d90f 100644
+--- a/esphome.example.yaml
++++ b/esphome.example.yaml
+@@ -111,6 +111,11 @@ ct002:
+   #                                # poll rate (~2 missed polls, like the real CT)
+   # dedupe_window: 0s              # 0 = off; >0 drops duplicate polls from the
+   #                                # same battery within the window
++  # battery_power_sensors:         # Venus E Mini: it doesn't report its power.
++  #   - mac: ccc837b39dbe          # Without an entry it takes 1/N of the grid;
++  #     sensor: mini_power         # with one it is steered like any battery.
++  #     phase: A                   # Any ESPHome sensor in W, charging positive
++  #     invert: false              # (invert: true if discharge is positive).
+ 
+   # ── Optional tuning blocks ──────────────────────────────────────────
+   # Everything below is optional and shown prepopulated with values that
+diff --git a/esphome/components/ct002/__init__.py b/esphome/components/ct002/__init__.py
+index 622337d..483280a 100644
+--- a/esphome/components/ct002/__init__.py
++++ b/esphome/components/ct002/__init__.py
+@@ -76,6 +76,12 @@ DashboardComponent = dashboard_ns.class_("DashboardComponent", cg.Component)
+ 
+ # Parent fields
+ CONF_POWER_SENSOR_L1 = "power_sensor_l1"
++# TEST PATCH: per-battery power sensors (Venus E Mini).
++CONF_BATTERY_POWER_SENSORS = "battery_power_sensors"
++CONF_BATTERY_MAC = "mac"
++CONF_BATTERY_SENSOR = "sensor"
++CONF_BATTERY_PHASE = "phase"
++CONF_BATTERY_INVERT = "invert"
+ CONF_POWER_SENSOR_L2 = "power_sensor_l2"
+ CONF_POWER_SENSOR_L3 = "power_sensor_l3"
+ CONF_CT_TYPE = "ct_type"
+@@ -463,6 +469,26 @@ def _validate_three_phase_sensors(config):
+     return config
+ 
+ 
++def _validate_battery_mac(value: str) -> str:
++    """TEST PATCH: a battery MAC as the battery sends it (12 hex, lowercase)."""
++    stripped = cv.string_strict(value).replace(":", "").replace("-", "").lower()
++    if len(stripped) != 12 or any(c not in "0123456789abcdef" for c in stripped):
++        raise cv.Invalid(f"battery mac must be 12 hex characters; got {value!r}")
++    return stripped
++
++
++BATTERY_POWER_SENSOR_SCHEMA = cv.Schema(
++    {
++        cv.Required(CONF_BATTERY_MAC): _validate_battery_mac,
++        cv.Required(CONF_BATTERY_SENSOR): cv.use_id(sensor.Sensor),
++        cv.Optional(CONF_BATTERY_PHASE, default="A"): cv.one_of(
++            "A", "B", "C", "D", upper=True
++        ),
++        cv.Optional(CONF_BATTERY_INVERT, default=False): cv.boolean,
++    }
++)
++
++
+ def _validate_ct_mac(value: str) -> str:
+     """Accept empty string (mirror-incoming) or a 12-hex-char MAC (no separators).
+ 
+@@ -986,6 +1012,9 @@ CONFIG_SCHEMA = cv.All(
+             cv.Required(CONF_POWER_SENSOR_L1): cv.use_id(sensor.Sensor),
+             cv.Optional(CONF_POWER_SENSOR_L2): cv.use_id(sensor.Sensor),
+             cv.Optional(CONF_POWER_SENSOR_L3): cv.use_id(sensor.Sensor),
++            cv.Optional(CONF_BATTERY_POWER_SENSORS, default=[]): cv.ensure_list(
++                BATTERY_POWER_SENSOR_SCHEMA
++            ),
+             cv.Optional(CONF_CT_TYPE, default="HME-4"): cv.one_of(
+                 "HME-4", "HME-3", upper=True
+             ),
+@@ -1041,6 +1070,17 @@ async def to_code(config):
+         cg.add(var.set_power_sensor_l2(sensor_l2))
+         cg.add(var.set_power_sensor_l3(sensor_l3))
+ 
++    for battery in config[CONF_BATTERY_POWER_SENSORS]:
++        battery_sensor = await cg.get_variable(battery[CONF_BATTERY_SENSOR])
++        cg.add(
++            var.add_battery_power_sensor(
++                battery[CONF_BATTERY_MAC],
++                battery_sensor,
++                battery[CONF_BATTERY_PHASE],
++                battery[CONF_BATTERY_INVERT],
++            )
++        )
++
+     # Unit → watts conversion (issue #572). A declared power unit yields a
+     # per-phase scale; declaring any unit (even W) also disables the runtime
+     # kW-suspicion heuristic for that phase. Non-power units were already
+diff --git a/esphome/components/ct002/ct002.cpp b/esphome/components/ct002/ct002.cpp
+index f5c574e..4e0df9c 100644
+--- a/esphome/components/ct002/ct002.cpp
++++ b/esphome/components/ct002/ct002.cpp
+@@ -313,7 +313,8 @@ void CT002Component::handle_request_(const uint8_t *data, size_t len,
+     ESP_LOGD(TAG, "Invalid CT002 request from %s: %s", addr_ip.c_str(), error.c_str());
+     return;
+   }
+-  const auto &fields = *parsed;
++  // Mutable: a battery power sensor may replace the reported phase/power.
++  auto fields = *parsed;
+   if (fields.size() < 4) return;
+   if (!this->validate_ct_mac_(fields)) return;
+ 
+@@ -331,13 +332,29 @@ void CT002Component::handle_request_(const uint8_t *data, size_t len,
+   // is combined / whole-home mode (newer Marstek firmware) — all four are
+   // valid, actively-steered phases, so they are NOT inspection. Mirrors
+   // ct002.py _handle_request.
+-  const bool in_inspection_mode = !is_steered_phase(reported_phase);
+   int reported_power = 0;
+   if (fields.size() > 5) {
+     // Match Python's parse_int (int()): reject trailing garbage / float
+     // syntax instead of strtol's lenient prefix parse.
+     reported_power = parse_int_strict(fields[5], 0);
+   }
++  // TEST PATCH: a battery with a power sensor is steered like any other: its
++  // measured power replaces the report, and a battery that reports no phase
++  // (the Venus E Mini) is placed on its configured phase. Mirrors ct002.py.
++  if (!this->battery_power_sensors_.empty()) {
++    std::string mac = fields[1];
++    for (auto &c : mac) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    const auto measured = this->battery_sensor_power_(mac);
++    if (measured.has_value()) {
++      reported_power = static_cast<int>(round_half_even(static_cast<double>(*measured)));
++      if (!is_steered_phase(reported_phase))
++        reported_phase = this->battery_power_sensors_.at(mac).phase;
++      while (fields.size() < 6) fields.emplace_back();
++      fields[4] = reported_phase;
++      fields[5] = std::to_string(reported_power);
++    }
++  }
++  const bool in_inspection_mode = !is_steered_phase(reported_phase);
+   // Optional 7th field: "participate" flag (newer senders, e.g. B2500).
+   // Absent/empty defaults to participating; an explicit 0 opts out.
+   bool participates = true;
+@@ -754,8 +771,37 @@ std::vector<float> CT002Component::compute_smooth_target_(const std::vector<floa
+   // as the device-level smooth_target sensor.
+   this->last_smooth_target_ = grid_total;
+   const auto shaved = this->peakshaving_(grid_total);
+-  auto out_arr = this->balancer_->compute_target(consumer_id, mode, reports, shaved.first,
+-                                                 inactive, manual, values, shaved.second);
++  // TEST PATCH (Venus E Mini): minis without a power sensor steer themselves
++  // on 1/N of the grid (see the x bucket in the response). Leave them out of
++  // the balancer, which only spreads the remaining share over the batteries
++  // whose power it can see -- unless they cannot act on this correction, in
++  // which case the others take all of it. Mirrors ct002.py.
++  float balancer_total = shaved.first;
++  std::vector<float> sample_id = values;
++  {
++    std::vector<std::string> blind;
++    std::vector<float> steered;
++    for (const Consumer *c : this->pool_()) {
++      if (is_blind_mini_(*c))
++        blind.push_back(c->consumer_id);
++      else
++        steered.push_back(c->power);
++    }
++    if (!blind.empty() && !steered.empty()) {
++      for (const auto &id : blind) inactive.insert(id);
++      const bool blocked = blind_blocked_(balancer_total, steered);
++      if (!blocked) {
++        balancer_total = balancer_total * static_cast<float>(steered.size()) /
++                         static_cast<float>(steered.size() + blind.size());
++      }
++      // The balancer caches per reading; a different split is a different sample.
++      sample_id.push_back(static_cast<float>(blind.size()));
++      sample_id.push_back(static_cast<float>(steered.size()));
++      sample_id.push_back(blocked ? 1.0f : 0.0f);
++    }
++  }
++  auto out_arr = this->balancer_->compute_target(consumer_id, mode, reports, balancer_total,
++                                                 inactive, manual, sample_id, shaved.second);
+   for (size_t i = 0; i < 3; ++i) this->last_target_[i] = out_arr[i];
+   return {out_arr[0], out_arr[1], out_arr[2]};
+ }
+@@ -860,7 +906,73 @@ std::vector<std::string> CT002Component::build_response_fields_(
+   fields[18] = to_int_str(phase_reports.chrg_power[BUCKET_ABC]);
+   fields[23] = to_int_str(phase_reports.dchrg_power[BUCKET_ABC]);
+ 
++  // TEST PATCH (Venus E Mini / VNSEM). Mirrors ct002.py.
++  std::string dev_upper = meter_dev_type;
++  for (auto &c : dev_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++  const bool is_mini = dev_upper.rfind("VNSEM", 0) == 0;
++  if (this->active_control_ && is_mini) {
++    std::string mac = meter_mac;
++    for (auto &c : mac) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    const bool has_sensor = this->battery_sensor_power_(mac).has_value();
++    if (has_sensor) {
++      // Steered through its power sensor: it gets its own target, so tell it
++      // it is alone and it applies that target in full.
++      fields[14] = "0";
++      fields[19] = "1";
++    } else if (!is_steered_phase(reported_phase)) {
++      // Without a power sensor it reports phase "0" and a status of 0/1
++      // instead of watts. A real CT003 only sums that status into the x
++      // bucket, so x_dchrg_power is the number of minis at work and each mini
++      // takes that share. Alone with other minis we do exactly that. Next to
++      // batteries with a known power it is told how many share in total
++      // (1/N), is never pushed against them, and is paced.
++      const auto pool = this->pool_();
++      std::vector<float> steered;
++      for (const Consumer *c : pool)
++        if (!is_blind_mini_(*c)) steered.push_back(c->power);
++      long x_chrg = 0;
++      long x_dchrg = 0;
++      float lo = -INFINITY;
++      float hi = INFINITY;
++      if (steered.empty()) {
++        for (const Consumer *c : pool) {
++          const long status = round_half_even(static_cast<double>(c->power));
++          if (status < 0) x_chrg += status;
++          if (status > 0) x_dchrg += status;
++        }
++      } else {
++        const long sharing = std::max<long>(1, static_cast<long>(pool.size()));
++        x_dchrg = sharing;
++        const float cap = MINI_MAX_STEP_W * static_cast<float>(sharing);
++        lo = -cap;
++        hi = cap;
++        if (std::all_of(steered.begin(), steered.end(),
++                        [](float p) { return p > MINI_DIRECTION_W; })) {
++          lo = 0.0f;
++        } else if (std::all_of(steered.begin(), steered.end(),
++                               [](float p) { return p < -MINI_DIRECTION_W; })) {
++          hi = 0.0f;
++        }
++      }
++      fields[14] = std::to_string(x_chrg);
++      fields[19] = std::to_string(x_dchrg);
++      long sum = 0;
++      for (size_t i = 0; i < 3; ++i) {
++        const float clamped = std::min(hi, std::max(lo, phase_power[i]));
++        const long rounded = round_half_even(static_cast<double>(clamped));
++        fields[4 + i] = std::to_string(rounded);
++        sum += rounded;
++      }
++      fields[7] = std::to_string(sum);
++    }
++  }
++
+   while (fields.size() < RESPONSE_LABEL_COUNT) fields.push_back("0");
++  // TEST PATCH: a real CT003 (HME-3) answers with 28 fields, appending its
++  // four cumulative energy registers (off-peak/peak import/export).
++  if (this->ct_type_ == "HME-3") {
++    for (int i = 0; i < 4; ++i) fields.push_back("0");
++  }
+   this->info_idx_counter_ = (this->info_idx_counter_ + 1) % 256;
+   return fields;
+ }
+@@ -1111,6 +1223,64 @@ bool CT002Component::dedup_should_process_(const std::string &consumer_id) {
+   return true;
+ }
+ 
++// --- TEST PATCH: Venus E Mini / battery power sensors (mirrors ct002.py) ---
++
++void CT002Component::add_battery_power_sensor(const std::string &mac, sensor::Sensor *s,
++                                              const std::string &phase, bool invert) {
++  BatteryPowerSensor entry;
++  entry.phase = phase.empty() ? "A" : phase;
++  entry.invert = invert;
++  this->battery_power_sensors_[mac] = entry;
++  if (s == nullptr) return;
++  s->add_on_state_callback([this, mac](float value) {
++    auto it = this->battery_power_sensors_.find(mac);
++    if (it == this->battery_power_sensors_.end()) return;
++    if (!std::isfinite(value)) {
++      it->second.updated_at = -1.0;
++      return;
++    }
++    // The sensor counts charging as positive; the balancer counts discharge
++    // as positive.
++    it->second.watts = it->second.invert ? value : -value;
++    it->second.updated_at = this->now_seconds_();
++  });
++}
++
++std::optional<float> CT002Component::battery_sensor_power_(const std::string &mac) const {
++  auto it = this->battery_power_sensors_.find(mac);
++  if (it == this->battery_power_sensors_.end()) return std::nullopt;
++  if (it->second.updated_at < 0.0) return std::nullopt;
++  if (this->now_seconds_() - it->second.updated_at > BATTERY_SENSOR_MAX_AGE_SECONDS)
++    return std::nullopt;
++  return it->second.watts;
++}
++
++bool CT002Component::is_blind_mini_(const Consumer &c) {
++  std::string dev = c.device_type;
++  for (auto &ch : dev) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
++  return dev.rfind("VNSEM", 0) == 0 && normalize_phase(c.phase) == "0";
++}
++
++std::vector<const Consumer *> CT002Component::pool_() const {
++  std::vector<const Consumer *> out;
++  const double now = this->now_seconds_();
++  for (const auto &kv : this->consumers_) {
++    const Consumer &c = kv.second;
++    if (c.timestamp > 0.0 && c.active && c.participates && !this->consumer_expired_(c, now))
++      out.push_back(&c);
++  }
++  return out;
++}
++
++bool CT002Component::blind_blocked_(float grid_total, const std::vector<float> &steered) {
++  if (steered.empty()) return false;
++  const bool all_dchrg = std::all_of(steered.begin(), steered.end(),
++                                     [](float p) { return p > MINI_DIRECTION_W; });
++  const bool all_chrg = std::all_of(steered.begin(), steered.end(),
++                                    [](float p) { return p < -MINI_DIRECTION_W; });
++  return (grid_total < 0.0f && all_dchrg) || (grid_total > 0.0f && all_chrg);
++}
++
+ void CT002Component::force_balancer_rotation() {
+   if (!this->balancer_) return;
+   // Mirror Python's force_efficiency_rotation pool filtering: only include
+diff --git a/esphome/components/ct002/ct002.h b/esphome/components/ct002/ct002.h
+index 1583d81..4e54f2e 100644
+--- a/esphome/components/ct002/ct002.h
++++ b/esphome/components/ct002/ct002.h
+@@ -70,6 +70,14 @@ constexpr double ADAPTIVE_TTL_POLL_MULTIPLIER = 2.0;
+ constexpr double ADAPTIVE_TTL_MIN_SECONDS = 5.0;
+ constexpr double ADAPTIVE_TTL_FALLBACK_SECONDS = 30.0;
+ 
++// TEST PATCH (Venus E Mini / VNSEM). How far a mini without a power sensor
++// may move per answer next to batteries with a known power, the output above
++// which such a battery counts as charging / discharging, and how old a
++// battery power sensor reading may be before it is ignored. Mirrors ct002.py.
++constexpr float MINI_MAX_STEP_W = 300.0f;
++constexpr float MINI_DIRECTION_W = 20.0f;
++constexpr double BATTERY_SENSOR_MAX_AGE_SECONDS = 5.0;
++
+ // A run of this many consecutive nonzero sub-1 W readings on a phase whose
+ // sensor declares no unit_of_measurement triggers a one-shot "input looks
+ // like kW" log warning (issue #572). Real watt-denominated grid meters
+@@ -168,6 +176,11 @@ class CT002Component : public Component {
+   // referenced sensor declares a power unit_of_measurement (kW → 1000, etc.).
+   // Declaring any unit — even "W" — also disables the runtime kW-suspicion
+   // warning for that phase, since the user has stated their intent.
++  // TEST PATCH: a sensor measuring a battery that reports no usable power
++  // (Venus E Mini). Positive = the battery draws power (charging) unless
++  // invert is set. Phase is used for a battery that reports none.
++  void add_battery_power_sensor(const std::string &mac, sensor::Sensor *s,
++                                const std::string &phase, bool invert);
+   void set_power_unit_scale(uint8_t idx, float scale) {
+     this->unit_scale_[idx] = scale;
+     this->unit_declared_[idx] = true;
+@@ -433,6 +446,20 @@ class CT002Component : public Component {
+   // (Re)constructs balancer_ from balancer_cfg_ + saturation_* members.
+   void build_balancer_();
+ 
++  // TEST PATCH: battery power sensors (see add_battery_power_sensor).
++  struct BatteryPowerSensor {
++    std::string phase{"A"};
++    bool invert{false};
++    float watts{0.0f};  // battery power, discharge positive
++    double updated_at{-1.0};
++  };
++  std::unordered_map<std::string, BatteryPowerSensor> battery_power_sensors_;
++  // Measured power (discharge positive) for *mac*, if fresh.
++  std::optional<float> battery_sensor_power_(const std::string &mac) const;
++  static bool is_blind_mini_(const Consumer &c);
++  std::vector<const Consumer *> pool_() const;
++  static bool blind_blocked_(float grid_total, const std::vector<float> &steered);
++
+   // Configuration.
+   sensor::Sensor *power_sensor_l1_{nullptr};
+   sensor::Sensor *power_sensor_l2_{nullptr};
+diff --git a/esphome/components/ct002/test_hooks.cpp b/esphome/components/ct002/test_hooks.cpp
+index 846bbef..c033bf6 100644
+--- a/esphome/components/ct002/test_hooks.cpp
++++ b/esphome/components/ct002/test_hooks.cpp
+@@ -29,6 +29,7 @@
+ #ifdef USE_CT002_TEST_HOOKS
+ 
+ #include <cerrno>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -150,6 +151,34 @@ void CT002Component::handle_control_command_(const std::string &cmd,
+     return;
+   }
+ 
++  // TEST PATCH: `battery_sensor <mac> <watts>` publishes a battery power
++  // sensor reading (sensor convention: charging positive) stamped "now";
++  // `battery_sensor <mac> nan` makes it unavailable.
++  if (cmd.rfind("battery_sensor ", 0) == 0) {
++    char mac[48] = {0};
++    char raw[32] = {0};
++    if (std::sscanf(cmd.c_str() + 15, "%47s %31s", mac, raw) == 2) {
++      auto it = this->battery_power_sensors_.find(mac);
++      if (it != this->battery_power_sensors_.end()) {
++        const double value = std::strtod(raw, nullptr);
++        if (std::isfinite(value)) {
++          it->second.watts = static_cast<float>(it->second.invert ? value : -value);
++          it->second.updated_at = this->now_seconds_();
++        } else {
++          it->second.updated_at = -1.0;
++        }
++        reply = std::string("ok battery_sensor ") + mac;
++      } else {
++        reply = "err battery_sensor (unknown mac)";
++      }
++    } else {
++      reply = "err battery_sensor (parse)";
++    }
++    this->control_socket_->sendto(reply.data(), reply.size(), 0,
++                                  reinterpret_cast<const struct sockaddr *>(&from), from_len);
++    return;
++  }
++
+   // Per-consumer setters carry a string consumer id, so parse them separately
+   // from the numeric verbs below (same approach as `cfg`). These mirror the
+   // MQTT/insights setters and let the shared e2e suite assert that a user
+diff --git a/ha_addon/config.yaml b/ha_addon/config.yaml
+index 2de0bed..8834ca7 100644
+--- a/ha_addon/config.yaml
++++ b/ha_addon/config.yaml
+@@ -67,6 +67,7 @@ schema:
+   cloud_reporting_interval: float(1,)?
+   active_control: bool?
+   peakshaving_threshold: float(0,10000)?
++  battery_power_sensors: str?
+   min_efficient_power: int(0,)?
+   efficiency_rotation_interval: int(1,)?
+   min_dc_output: float(0,)?
+diff --git a/ha_addon/translations/en.yaml b/ha_addon/translations/en.yaml
+index 920674a..4fd09e7 100644
+--- a/ha_addon/translations/en.yaml
++++ b/ha_addon/translations/en.yaml
+@@ -32,6 +32,9 @@ configuration:
+   peakshaving_threshold:
+     name: Peak Shaving Threshold
+     description: "For tariffs that bill on peak demand (e.g. the Belgian capacity tariff): the batteries only cover net household demand above this many watts. Below it they stay idle instead of covering everyday load, while solar surplus still charges them. Set to 0 to disable (default); up to 10000. Also adjustable live from the dashboard or Home Assistant. Only applies to CT002/CT003 device types with active control."
++  battery_power_sensors:
++    name: Battery Power Sensors
++    description: "Optional. For batteries that do not report their own power, such as the Marstek Venus E Mini: a Home Assistant sensor that measures each one (a smart plug in front of it, for example), so it is steered like any other battery. Format: <battery MAC>=<sensor entity>[@phase], comma separated, e.g. 'ccc837b39dbe=sensor.mini_plug_power@A'. The sensor counts charging as positive; put '-' before the entity if yours counts discharging as positive. The phase (A, B, C or D) defaults to A. It should update about once a second. A Venus E Mini without a sensor still works: it takes an equal share of the grid. Only applies to CT002/CT003 device types with active control."
+   min_efficient_power:
+     name: Min Efficient Power
+     description: "Minimum watts each active battery should handle. At low demand, excess batteries are idled so the remaining ones stay above this threshold and operate more efficiently. Set to 0 to disable (default). Example: 2 batteries, 200 W demand, threshold 150 — one battery gets 200 W, the other idles. Only applies to CT002/CT003 device types."
+diff --git a/src/astrameter/config/addon.py b/src/astrameter/config/addon.py
+index af9cf35..8440ea9 100644
+--- a/src/astrameter/config/addon.py
++++ b/src/astrameter/config/addon.py
+@@ -121,6 +121,7 @@ _CT_FIELDS = (
+     "ct_mac",
+     "active_control",
+     "peakshaving_threshold",
++    "battery_power_sensors",
+     "min_efficient_power",
+     "efficiency_rotation_interval",
+     "min_dc_output",
+diff --git a/src/astrameter/config/config_loader.py b/src/astrameter/config/config_loader.py
+index 94de27b..7edce10 100644
+--- a/src/astrameter/config/config_loader.py
++++ b/src/astrameter/config/config_loader.py
+@@ -915,6 +915,40 @@ def create_powermeter(
+     return None
+ 
+ 
++def powermeter_prefix(section: str) -> str | None:
++    """The power meter type a section name selects, if any."""
++    for prefix, _factory in _FACTORIES:
++        if section.startswith(prefix):
++            return prefix
++    return None
++
++
++def create_battery_source(
++    section: str, config: configparser.ConfigParser
++) -> Powermeter | None:
++    """TEST PATCH: the power meter a battery-sensor section describes.
++
++    The section's ``SOURCE`` key names the meter type; every other key is that
++    type's usual one. Its name must not start with a meter type, or the grid
++    reader would pick it up as a power source as well.
++    """
++    if powermeter_prefix(section) is not None:
++        logger.error(
++            "Section [%s] is read as a grid power source; give the battery "
++            "sensor a name that does not start with a meter type, e.g. "
++            "[BATTERY_%s]",
++            section,
++            section,
++        )
++        return None
++    source = config.get(section, "SOURCE", fallback="").strip().upper()
++    for prefix, factory in _FACTORIES:
++        if source == prefix and factory is not None:
++            return factory(section, config)
++    logger.error("Section [%s]: SOURCE = %r is not a power meter type", section, source)
++    return None
++
++
+ def read_mqtt_insights_config(
+     config: configparser.ConfigParser,
+ ) -> MqttInsightsConfig | None:
+diff --git a/src/astrameter/config/ini_config.py b/src/astrameter/config/ini_config.py
+index 195af15..f307f8b 100644
+--- a/src/astrameter/config/ini_config.py
++++ b/src/astrameter/config/ini_config.py
+@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
+ from astrameter.config.config_loader import (
+     GENERAL_KEY_OVERRIDES,
+     SIGNAL_KEY_OVERRIDES,
++    create_battery_source,
+     general_key,
+     ini_key,
+     new_config_parser,
+@@ -35,6 +36,7 @@ from astrameter.config.settings import (
+ if TYPE_CHECKING:
+     from astrameter.config.settings import ConfiguredPowermeter
+     from astrameter.mqtt_insights import MqttInsightsConfig
++    from astrameter.powermeter import Powermeter
+ 
+ GENERAL_SECTION = "GENERAL"
+ MARSTEK_SECTION = "MARSTEK"
+@@ -130,6 +132,14 @@ class IniAppConfig(AppConfig):
+     def powermeters(self, general: GeneralSettings) -> list[ConfiguredPowermeter]:
+         return read_all_powermeter_configs(self._config, general.signal)
+ 
++    def battery_source(self, name: str) -> Powermeter | None:
++        """TEST PATCH: build the meter section *name* (any case) describes."""
++        wanted = name.strip().upper()
++        for section in self._config.sections():
++            if section.upper() == wanted:
++                return create_battery_source(section, self._config)
++        return None
++
+ 
+ # Rendering settings back into a ``config.ini`` is what lets the dashboard hand
+ # a guided-setup user a file to take over from. It is the readers' inverse and
+diff --git a/src/astrameter/config/settings.py b/src/astrameter/config/settings.py
+index 1f8c3fc..dd66131 100644
+--- a/src/astrameter/config/settings.py
++++ b/src/astrameter/config/settings.py
+@@ -187,6 +187,13 @@ class CtSettings:
+     efficiency_saturation_threshold: float = 0.4
+     efficiency_demand_alpha: float = 0.1
+     min_dc_output: float = 0.0
++    # TEST PATCH: "<battery mac>=[-]<entity id>[@A|B|C|D], ..." -- Home
++    # Assistant sensors measuring batteries that do not report their own
++    # power (Venus E Mini). Charging counts positive unless prefixed with "-".
++    battery_power_sensors: str = ""
++    # Home Assistant to read them from; empty inside the add-on.
++    battery_sensors_ha_url: str = ""
++    battery_sensors_ha_token: str = ""
+ 
+ 
+ @dataclass(frozen=True)
+@@ -243,6 +250,14 @@ class AppConfig(ABC):
+         overrides applied to it also reach the power sources.
+         """
+ 
++    def battery_source(self, name: str) -> Powermeter | None:
++        """TEST PATCH: the meter a battery-sensor section *name* describes.
++
++        Only a backend with config sections has any; the others return
++        ``None`` and battery sensors are then Home Assistant entities only.
++        """
++        return None
++
+     def render_powermeters_ini(self) -> str:
+         """The power-source sections of an equivalent ``config.ini``.
+ 
+diff --git a/src/astrameter/ct002/battery_sensors.py b/src/astrameter/ct002/battery_sensors.py
+new file mode 100644
+index 0000000..5d8aafa
+--- /dev/null
++++ b/src/astrameter/ct002/battery_sensors.py
+@@ -0,0 +1,280 @@
++"""Measured battery power for batteries that do not report it (TEST PATCH).
++
++Some batteries -- notably the Marstek Venus E Mini (VNSEM) -- report neither a
++phase nor their real power over the CT protocol, so the balancer cannot steer
++them like the other batteries. Any power source that measures such a battery
++(a smart plug in front of it, a Home Assistant sensor, an MQTT topic, ...)
++fills that gap, and the battery is then steered like any other.
++
++Configured per battery as::
++
++    BATTERY_POWER_SENSORS = <battery mac>=[-]<source>[@<phase>], ...
++
++``<source>`` is either
++
++* the name of a config section whose ``SOURCE`` key names a power meter type
++  (``JSON_HTTP``, ``SHELLY``, ``TASMOTA``, ``MQTT``, ``HOMEASSISTANT``, ...) and
++  whose other keys are that meter's usual keys, or
++* a Home Assistant entity id (``sensor.mini_power``), read from
++  ``BATTERY_SENSORS_HA_URL`` / ``BATTERY_SENSORS_HA_TOKEN`` (or, inside the
++  add-on, through the Supervisor).
++
++The source counts power the battery **draws** (charging) as positive, the way
++a plug in front of it measures it; prefix it with ``-`` for the opposite sign.
++``@A`` / ``@B`` / ``@C`` / ``@D`` (combined) is the phase a battery that reports
++none is steered on; it defaults to A.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import logging
++import os
++import time
++from collections.abc import Callable
++from dataclasses import dataclass
++from typing import TYPE_CHECKING
++from urllib.parse import urlparse
++
++if TYPE_CHECKING:
++    from astrameter.powermeter.base import Powermeter
++
++logger = logging.getLogger("astrameter")
++
++DEFAULT_PHASE = "A"
++VALID_PHASES = ("A", "B", "C", "D")
++POLL_INTERVAL_SECONDS = 1.0
++READ_TIMEOUT_SECONDS = 2.0
++# A reading older than this is not used; the battery then falls back to the
++# behaviour it would have without a sensor.
++MAX_AGE_SECONDS = 5.0
++# Failures this soon after start are the source still connecting.
++STARTUP_GRACE_SECONDS = 10.0
++
++#: Builds the power meter a config section describes, or ``None``.
++SourceFactory = Callable[[str], "Powermeter | None"]
++
++
++@dataclass(frozen=True)
++class BatterySource:
++    name: str
++    phase: str = DEFAULT_PHASE
++    # True when the source counts discharge as positive (``-`` prefix).
++    inverted: bool = False
++
++    @property
++    def is_entity(self) -> bool:
++        return "." in self.name
++
++
++def parse_sources(spec: str) -> dict[str, BatterySource]:
++    """``"aabb..=MINI_PLUG@B, ccdd..=-sensor.x"`` -> ``{mac: BatterySource}``."""
++    sources: dict[str, BatterySource] = {}
++    for part in spec.split(","):
++        part = part.strip()
++        if not part:
++            continue
++        mac, sep, target = part.partition("=")
++        mac = mac.strip().lower().replace(":", "").replace("-", "")
++        name, _, phase = target.partition("@")
++        name = name.strip()
++        inverted = name.startswith("-")
++        name = name.lstrip("-").strip()
++        phase = phase.strip().upper() or DEFAULT_PHASE
++        if not sep or len(mac) != 12 or not name or phase not in VALID_PHASES:
++            logger.error(
++                "Ignoring BATTERY_POWER_SENSORS entry %r; expected "
++                "<battery mac>=[-]<section or entity id>[@A|B|C|D]",
++                part,
++            )
++            continue
++        sources[mac] = BatterySource(name, phase, inverted)
++    return sources
++
++
++def build_ha_entity_meter(entity: str, ha_url: str, ha_token: str) -> Powermeter | None:
++    """A Home Assistant reader for a single entity."""
++    from astrameter.powermeter.homeassistant import HomeAssistant
++
++    supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
++    if ha_url:
++        parsed = urlparse(ha_url if "://" in ha_url else f"http://{ha_url}")
++        https = parsed.scheme == "https"
++        host = parsed.hostname or ""
++        port = str(parsed.port or (443 if https else 8123))
++        prefix = parsed.path.rstrip("/") or None
++        token = ha_token or supervisor_token
++        if not host or not token:
++            logger.error(
++                "BATTERY_POWER_SENSORS: BATTERY_SENSORS_HA_URL needs a host and "
++                "BATTERY_SENSORS_HA_TOKEN a long-lived access token"
++            )
++            return None
++    elif supervisor_token:
++        # Inside the Home Assistant add-on: go through the Supervisor proxy.
++        https, host, port, prefix = False, "supervisor", "80", "/core"
++        token = ""
++    else:
++        logger.error(
++            "BATTERY_POWER_SENSORS names %s but there is no Home Assistant to "
++            "read it from: set BATTERY_SENSORS_HA_URL and BATTERY_SENSORS_HA_TOKEN",
++            entity,
++        )
++        return None
++
++    def token_getter() -> str:
++        return token or os.environ.get("SUPERVISOR_TOKEN", "")
++
++    return HomeAssistant(
++        host,
++        port,
++        https,
++        token_getter,
++        current_power_entity=[entity],
++        power_calculate=False,
++        power_input_alias=[],
++        power_output_alias=[],
++        path_prefix=prefix,
++    )
++
++
++class BatteryPowerSensors:
++    def __init__(
++        self,
++        sources: dict[str, BatterySource],
++        ha_url: str = "",
++        ha_token: str = "",
++        clock: Callable[[], float] = time.monotonic,
++    ) -> None:
++        self._sources = sources
++        self._ha_url = ha_url
++        self._ha_token = ha_token
++        self._clock = clock
++        self._factory: SourceFactory | None = None
++        self._meters: dict[str, Powermeter] = {}
++        # mac -> (battery power in watts, discharge positive; reading time)
++        self._readings: dict[str, tuple[float, float]] = {}
++        self._available: dict[str, bool] = {}
++        self._tasks: list[asyncio.Task[None]] = []
++        self._started_at = 0.0
++
++    @classmethod
++    def from_settings(
++        cls, spec: str, ha_url: str = "", ha_token: str = ""
++    ) -> BatteryPowerSensors | None:
++        sources = parse_sources(spec)
++        return cls(sources, ha_url, ha_token) if sources else None
++
++    def set_source_factory(self, factory: SourceFactory | None) -> None:
++        """How to build a meter from a config section name."""
++        self._factory = factory
++
++    def power_for(self, mac: str) -> int | None:
++        """Measured battery power (discharge positive), or ``None`` if unknown."""
++        reading = self._readings.get(mac.lower())
++        if reading is None:
++            return None
++        power, at = reading
++        if self._clock() - at > MAX_AGE_SECONDS:
++            return None
++        return round(power)
++
++    def phase_for(self, mac: str) -> str:
++        """The phase configured for *mac* (A when none was given)."""
++        source = self._sources.get(mac.lower())
++        return source.phase if source else DEFAULT_PHASE
++
++    def _build(self, source: BatterySource) -> Powermeter | None:
++        if not source.is_entity:
++            if self._factory is not None:
++                meter = self._factory(source.name)
++                if meter is not None:
++                    return meter
++            logger.error(
++                "BATTERY_POWER_SENSORS: no usable section [%s] (it needs a "
++                "SOURCE key naming a power meter type, e.g. SOURCE = JSON_HTTP)",
++                source.name,
++            )
++            return None
++        return build_ha_entity_meter(source.name, self._ha_url, self._ha_token)
++
++    async def start(self) -> None:
++        self._started_at = self._clock()
++        for mac, source in self._sources.items():
++            meter = self._build(source)
++            if meter is None:
++                continue
++            self._meters[mac] = meter
++            logger.info(
++                "Battery %s: reading its power from %s (phase %s%s)",
++                mac,
++                source.name,
++                source.phase,
++                ", inverted" if source.inverted else "",
++            )
++            try:
++                await meter.start()
++            except Exception:
++                logger.exception("Battery %s: %s failed to start", mac, source.name)
++                continue
++            self._tasks.append(asyncio.create_task(self._poll(mac, source, meter)))
++
++    async def stop(self) -> None:
++        for task in self._tasks:
++            task.cancel()
++        for task in self._tasks:
++            with contextlib.suppress(asyncio.CancelledError):
++                await task
++        self._tasks.clear()
++        for meter in self._meters.values():
++            with contextlib.suppress(Exception):
++                await meter.stop()
++        self._meters.clear()
++
++    async def _poll(self, mac: str, source: BatterySource, meter: Powermeter) -> None:
++        while True:
++            try:
++                values = await asyncio.wait_for(
++                    meter.get_powermeter_watts(), READ_TIMEOUT_SECONDS
++                )
++                drawn = float(sum(values))
++                # The source counts charging as positive; the balancer counts
++                # discharge as positive.
++                power = drawn if source.inverted else -drawn
++                self._readings[mac] = (power, self._clock())
++                self._note(mac, source, True)
++                logger.debug(
++                    "Battery %s: %s reads %s W (battery %s W)",
++                    mac,
++                    source.name,
++                    drawn,
++                    power,
++                )
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                self._note(mac, source, False, f"{type(exc).__name__}: {exc}")
++            await asyncio.sleep(POLL_INTERVAL_SECONDS)
++
++    def _note(
++        self, mac: str, source: BatterySource, available: bool, reason: str = ""
++    ) -> None:
++        if self._available.get(mac) == available:
++            return
++        if (
++            not available
++            and mac not in self._available
++            and self._clock() - self._started_at < STARTUP_GRACE_SECONDS
++        ):
++            return  # still connecting; not worth a warning yet
++        self._available[mac] = available
++        if available:
++            logger.info("Battery %s: power from %s is live", mac, source.name)
++        else:
++            logger.warning(
++                "Battery %s: %s unusable (%s); using the battery's own report",
++                mac,
++                source.name,
++                reason,
++            )
+diff --git a/src/astrameter/ct002/ct002.py b/src/astrameter/ct002/ct002.py
+index 8a2c3c7..4b53a5e 100644
+--- a/src/astrameter/ct002/ct002.py
++++ b/src/astrameter/ct002/ct002.py
+@@ -28,6 +28,7 @@ from .balancer import (
+     device_capabilities,
+     phase_index,
+ )
++from .battery_sensors import BatteryPowerSensors
+ from .protocol import (
+     ETX,
+     RESPONSE_LABELS,
+@@ -82,6 +83,11 @@ PEAKSHAVING_IDLE_BAND_W = 100.0
+ # (phase "D") reporters.
+ PHASE_BUCKETS = ("x", "A", "B", "C", "ABC")
+ 
++# TEST PATCH (Venus E Mini): how far the mini may move per answer, and the
++# output above which another battery counts as charging / discharging.
++MINI_MAX_STEP_W = 300
++MINI_DIRECTION_W = 20
++
+ # Default eviction policy (``consumer_ttl=None``): the real CT clears a slave
+ # slot that missed roughly 1-2 of its own poll cycles, so by default a
+ # consumer expires after missing ~2 cycles of its observed cadence.  The floor
+@@ -470,7 +476,17 @@ class CT002:
+         device_id: str = "",
+         clock: Callable[[], float] | None = None,
+         reset_fn: Callable[[], None] | None = None,
++        battery_power_sensors: str = "",
++        battery_sensors_ha_url: str = "",
++        battery_sensors_ha_token: str = "",
+     ) -> None:
++        # TEST PATCH: measured power for batteries that do not report it.
++        self.battery_power_sensors = battery_power_sensors
++        self.battery_sensors_ha_url = battery_sensors_ha_url
++        self.battery_sensors_ha_token = battery_sensors_ha_token
++        self._power_sensors = BatteryPowerSensors.from_settings(
++            battery_power_sensors, battery_sensors_ha_url, battery_sensors_ha_token
++        )
+         self.udp_port = udp_port
+         self.ct_mac = normalize_ct_mac(ct_mac)
+         self.ct_type = ct_type
+@@ -945,6 +961,21 @@ class CT002:
+             for cid, c in self._consumers.items()
+             if not c.active or not c.participates
+         )
++        # TEST PATCH (Venus E Mini): minis without a power sensor steer
++        # themselves on 1/N of the grid (see the x bucket in the response).
++        # Leave them out of the balancer, which only spreads the remaining
++        # share over the batteries whose power it can see -- unless they cannot
++        # act on this correction, in which case the others take all of it.
++        blind = self._blind_minis()
++        steered = self._steered_powers()
++        if blind and steered:
++            inactive |= frozenset(blind)
++            blocked = self._blind_blocked(total, steered)
++            if not blocked:
++                total = total * len(steered) / (len(steered) + len(blind))
++            # The balancer caches per reading; a different split is a
++            # different sample.
++            sample_id = (*sample_id, len(blind), len(steered), blocked)
+         manual = frozenset(
+             cid for cid, c in self._consumers.items() if c.manual_enabled
+         )
+@@ -960,6 +991,52 @@ class CT002:
+             hold_at_zero=hold_at_zero,
+         )
+ 
++    @staticmethod
++    def _is_blind_mini(c: Consumer) -> bool:
++        """A Venus E Mini without a power sensor: no phase, no real power."""
++        return str(c.device_type).upper().startswith("VNSEM") and (
++            normalize_phase(c.phase) == "0"
++        )
++
++    def _pool(self) -> list[Consumer]:
++        """Batteries currently polling and taking part (TEST PATCH)."""
++        now = self._clock()
++        return [
++            c
++            for c in self._consumers.values()
++            if c.timestamp > 0
++            and c.active
++            and c.participates
++            and not self._consumer_expired(c, now)
++        ]
++
++    def _blind_minis(self) -> list[str]:
++        """Active minis without a power sensor (TEST PATCH)."""
++        pool = {id(c) for c in self._pool()}
++        return [
++            cid
++            for cid, c in self._consumers.items()
++            if id(c) in pool and self._is_blind_mini(c)
++        ]
++
++    def _steered_powers(self) -> list[int]:
++        """Reported power of the active batteries the balancer can see."""
++        return [c.power for c in self._pool() if not self._is_blind_mini(c)]
++
++    @staticmethod
++    def _blind_blocked(grid_total: float, steered: list[int]) -> bool:
++        """Whether a sensorless mini is kept out of this correction.
++
++        It is never shown export while all the measured batteries discharge,
++        nor import while they all charge, so the two cannot end up pushing
++        energy into each other.
++        """
++        if not steered:
++            return False
++        return (grid_total < 0 and all(p > MINI_DIRECTION_W for p in steered)) or (
++            grid_total > 0 and all(p < -MINI_DIRECTION_W for p in steered)
++        )
++
+     def _collect_reports_by_phase(self) -> dict[str, PhaseBucket]:
+         by_phase = {bucket: PhaseBucket() for bucket in PHASE_BUCKETS}
+ 
+@@ -1271,7 +1348,59 @@ class CT002:
+         response_fields[18] = str(abc.chrg_power)
+         response_fields[23] = str(abc.dchrg_power)
+ 
++        # TEST PATCH (Venus E Mini / VNSEM) without a power sensor: it reports
++        # phase "0" and a status of 0/1 instead of watts. A real CT003 counts
++        # such reporters in no *_chrg_nb field; it only sums their status into
++        # the x bucket, so x_dchrg_power is the number of minis at work, and
++        # each mini takes that share of the grid. Alone with other minis we do
++        # exactly that. Next to batteries with a known power, the mini is told
++        # how many batteries share in total (1/N), is never pushed against
++        # them, and is paced so it does not run ahead of them.
++        if (
++            self.active_control
++            and request.in_inspection_mode
++            and request.meter_dev_type.upper().startswith("VNSEM")
++        ):
++            pool = self._pool()
++            steered = [c.power for c in pool if not self._is_blind_mini(c)]
++            if not steered:
++                statuses = [parse_int(c.power, 0) for c in pool]
++                x_chrg = sum(v for v in statuses if v < 0)
++                x_dchrg = sum(v for v in statuses if v > 0)
++                lo, hi = -math.inf, math.inf
++            else:
++                sharing = max(1, len(pool))
++                x_chrg, x_dchrg = 0, sharing
++                cap = MINI_MAX_STEP_W * sharing
++                lo, hi = -cap, cap
++                if all(p > MINI_DIRECTION_W for p in steered):
++                    lo = 0
++                elif all(p < -MINI_DIRECTION_W for p in steered):
++                    hi = 0
++            response_fields[14] = str(x_chrg)
++            response_fields[19] = str(x_dchrg)
++            for idx in (4, 5, 6):
++                value = parse_int(response_fields[idx], 0)
++                response_fields[idx] = str(round(min(hi, max(lo, value))))
++            response_fields[7] = str(
++                sum(parse_int(response_fields[idx], 0) for idx in (4, 5, 6))
++            )
++
++        # TEST PATCH: a mini steered through its power sensor gets its own
++        # target; tell it it is alone so it applies that target in full.
++        if (
++            self.active_control
++            and not request.in_inspection_mode
++            and request.meter_dev_type.upper().startswith("VNSEM")
++        ):
++            response_fields[14] = "0"
++            response_fields[19] = "1"
++
+         response_fields += ["0"] * (len(RESPONSE_LABELS) - len(response_fields))
++        # TEST PATCH: a real CT003 (HME-3) answers with 28 fields, appending its
++        # four cumulative energy registers (off-peak/peak import/export).
++        if self.ct_type == "HME-3":
++            response_fields += ["0", "0", "0", "0"]
+         self._info_idx_counter = (self._info_idx_counter + 1) % 256
+         return response_fields
+ 
+@@ -1432,6 +1561,21 @@ class CT002:
+             return None
+ 
+         request = CT002Request.from_fields(fields, addr)
++        # TEST PATCH: a battery with a power sensor is steered like any other:
++        # its measured power replaces the report, and a battery that reports
++        # no phase (the Venus E Mini) is placed on its configured phase.
++        if self._power_sensors is not None:
++            measured = self._power_sensors.power_for(request.meter_mac)
++            if measured is not None:
++                request = dataclasses.replace(
++                    request,
++                    power=measured,
++                    phase=(
++                        self._power_sensors.phase_for(request.meter_mac)
++                        if request.in_inspection_mode
++                        else request.phase
++                    ),
++                )
+         if not self._ct_mac_matches(request):
+             logger.debug(
+                 "Ignoring CT002 request from %s due to CT MAC mismatch (req=%s, cfg=%s)",
+@@ -1695,6 +1839,11 @@ class CT002:
+         except asyncio.CancelledError:
+             pass
+ 
++    def set_battery_source_factory(self, factory: Callable[[str], Any] | None) -> None:
++        """TEST PATCH: how battery-sensor section names become meters."""
++        if self._power_sensors is not None:
++            self._power_sensors.set_source_factory(factory)
++
+     async def start(self) -> None:
+         self._server = await UdpServer.serve(self.udp_port, self._safe_handle_request)
+         # Read the bound port back: a configured 0 asks the OS to pick one, and
+@@ -1702,6 +1851,8 @@ class CT002:
+         self.udp_port = self._server.port or self.udp_port
+         self._stopped.clear()
+         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
++        if self._power_sensors is not None:
++            await self._power_sensors.start()
+         self._started_at = self._clock()
+         self._running = True
+         self._rev += 1
+@@ -1711,6 +1862,8 @@ class CT002:
+         await self._stopped.wait()
+ 
+     async def stop(self) -> None:
++        if self._power_sensors is not None:
++            await self._power_sensors.stop()
+         if self._cleanup_task:
+             self._cleanup_task.cancel()
+             with contextlib.suppress(asyncio.CancelledError):
+diff --git a/src/astrameter/main.py b/src/astrameter/main.py
+index 796e8be..dc370b7 100644
+--- a/src/astrameter/main.py
++++ b/src/astrameter/main.py
+@@ -142,6 +142,9 @@ def _build_ct002(
+         saturation_stall_timeout_seconds=ct.saturation_stall_timeout_seconds,
+         device_id=device_id,
+         reset_fn=reset_fn,
++        battery_power_sensors=ct.battery_power_sensors,
++        battery_sensors_ha_url=ct.battery_sensors_ha_url,
++        battery_sensors_ha_token=ct.battery_sensors_ha_token,
+     )
+ 
+ 
+@@ -375,6 +378,8 @@ async def run_device(
+     logger.debug("Starting device: %s", device_type)
+     ct = config.ct(device_type) if is_ct(device_type) else None
+     device = _build_device(device_type, ct, general, powermeters, device_id)
++    if isinstance(device, CT002):
++        device.set_battery_source_factory(config.battery_source)
+     if insights:
+         device.event_listener = _forward_events(insights, device)
+ 
+diff --git a/tests/components/ct002/test.mini.host.yaml b/tests/components/ct002/test.mini.host.yaml
+new file mode 100644
+index 0000000..3f58c0e
+--- /dev/null
++++ b/tests/components/ct002/test.mini.host.yaml
+@@ -0,0 +1,46 @@
++# TEST PATCH: Venus E Mini scenarios (test_mini_e2e.py). Same control channel
++# as test.e2e.host.yaml, a CT003, and one mini with a battery power sensor.
++esphome:
++  name: ct002-mini-test
++
++host:
++
++logger:
++  level: DEBUG
++
++external_components:
++  - source:
++      type: local
++      path: ../../../esphome/components
++    components: [ct002]
++
++sensor:
++  - platform: template
++    id: grid_l1
++    update_interval: never
++  - platform: template
++    id: grid_l2
++    update_interval: never
++  - platform: template
++    id: grid_l3
++    update_interval: never
++  # Fed through the control channel (`battery_sensor <mac> <watts>`).
++  - platform: template
++    id: mini_power
++    update_interval: never
++
++ct002:
++  id: ct002_main
++  power_sensor_l1: grid_l1
++  power_sensor_l2: grid_l2
++  power_sensor_l3: grid_l3
++  ct_type: HME-3
++  udp_port: 12345
++  active_control: true
++  consumer_ttl: 100000s
++  dedupe_window: 0s
++  test_control_port: 12346
++  battery_power_sensors:
++    - mac: "cc:c8:37:b3:9d:be"
++      sensor: mini_power
++      phase: B
+diff --git a/tests/components/ct002/test_mini_e2e.py b/tests/components/ct002/test_mini_e2e.py
+new file mode 100644
+index 0000000..1583976
+--- /dev/null
++++ b/tests/components/ct002/test_mini_e2e.py
+@@ -0,0 +1,243 @@
++"""TEST PATCH: Venus E Mini parity between the Python emulator and ESPHome.
++
++Drives the same mixed fleet -- a Venus, a mini with a battery power sensor and
++a mini without one -- through both backends and checks that every response
++they send is identical, field for field.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import os
++import shutil
++import signal
++import socket
++import subprocess
++import time
++from collections.abc import Iterator
++from pathlib import Path
++
++import pytest
++
++from astrameter.ct002.ct002 import CT002
++from astrameter.ct002.protocol import build_payload, parse_request
++
++HERE = Path(__file__).parent
++REPO_ROOT = HERE.parent.parent.parent
++MINI_YAML = HERE / "test.mini.host.yaml"
++MINI_BINARY = (
++    HERE
++    / ".esphome"
++    / "build"
++    / "ct002-mini-test"
++    / ".pioenvs"
++    / "ct002-mini-test"
++    / "program"
++)
++UDP_PORT = 12345
++CONTROL_PORT = 12346
++
++VENUS = "24215edb1931"
++MINI_SENSOR = "ccc837b39dbe"  # has a battery power sensor (phase B)
++MINI_BLIND = "aabbccddeeff"
++
++pytestmark = [
++    pytest.mark.esphome_e2e,
++    pytest.mark.skipif(
++        shutil.which("esphome") is None and not MINI_BINARY.exists(),
++        reason="esphome CLI not on PATH",
++    ),
++]
++
++
++def _venus_poll(power: int) -> list[str]:
++    return ["HMG-50", VENUS, "HME-3", "000000000000", "A", str(power)]
++
++
++def _mini_poll(mac: str, status: int = 1) -> list[str]:
++    return ["VNSEM-0", mac, "HME-3", "000000000000", "0", str(status)]
++
++
++class _Clock:
++    def __init__(self) -> None:
++        self.now = 1000.0
++
++    def __call__(self) -> float:
++        return self.now
++
++
++class _Transport:
++    def __init__(self) -> None:
++        self.sent: list[bytes] = []
++
++    def sendto(self, data: bytes, addr) -> None:
++        self.sent.append(data)
++
++
++class PythonBackend:
++    def __init__(self) -> None:
++        self.clock = _Clock()
++        self.grid = [0.0, 0.0, 0.0]
++        self.ct = CT002(
++            ct_type="HME-3",
++            active_control=True,
++            consumer_ttl=100000,
++            clock=self.clock,
++            battery_power_sensors=f"{MINI_SENSOR}=sensor.mini_power@B",
++        )
++        assert self.ct._power_sensors is not None
++        self.ct._power_sensors._clock = self.clock
++
++        async def before_send(*_args, **_kwargs):
++            return list(self.grid)
++
++        self.ct.before_send = before_send
++
++    def set_grid(self, l1: float) -> None:
++        self.grid = [l1, 0.0, 0.0]
++
++    def advance(self, seconds: float) -> None:
++        self.clock.now += seconds
++
++    def battery_sensor(self, mac: str, watts: float | None) -> None:
++        sensors = self.ct._power_sensors
++        assert sensors is not None
++        if watts is None:
++            sensors._readings.pop(mac, None)
++        else:
++            sensors._readings[mac] = (-watts, self.clock())
++
++    def poll(self, fields: list[str]) -> list[str]:
++        transport = _Transport()
++        asyncio.run(
++            self.ct._handle_request(
++                build_payload(fields), ("127.0.0.1", 40000), transport
++            )
++        )
++        out, err = parse_request(transport.sent[-1])
++        assert err is None
++        return out
++
++
++class EsphomeBackend:
++    def __init__(self) -> None:
++        self._ctrl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        self._ctrl.settimeout(2.0)
++        self._cmd("clock_set 1000")
++
++    def _cmd(self, cmd: str) -> None:
++        self._ctrl.sendto(cmd.encode(), ("127.0.0.1", CONTROL_PORT))
++        reply = self._ctrl.recvfrom(256)[0].decode()
++        assert reply.startswith("ok"), f"{cmd!r}: {reply!r}"
++
++    def set_grid(self, l1: float) -> None:
++        self._cmd(f"grid {l1} 0 0")
++
++    def advance(self, seconds: float) -> None:
++        self._cmd(f"clock_advance {seconds}")
++
++    def battery_sensor(self, mac: str, watts: float | None) -> None:
++        self._cmd(f"battery_sensor {mac} {'nan' if watts is None else watts}")
++
++    def poll(self, fields: list[str]) -> list[str]:
++        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        s.settimeout(2.0)
++        try:
++            s.sendto(build_payload(fields), ("127.0.0.1", UDP_PORT))
++            data = s.recvfrom(512)[0]
++        finally:
++            s.close()
++        out, err = parse_request(data)
++        assert err is None
++        return out
++
++    def close(self) -> None:
++        self._ctrl.close()
++
++
++def _port_in_use(port: int) -> bool:
++    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
++        try:
++            s.bind(("127.0.0.1", port))
++        except OSError:
++            return True
++    return False
++
++
++@pytest.fixture
++def esphome() -> Iterator[EsphomeBackend]:
++    if not MINI_BINARY.exists():
++        subprocess.run(
++            ["esphome", "compile", str(MINI_YAML)], check=True, cwd=REPO_ROOT
++        )
++    deadline = time.monotonic() + 5.0
++    while _port_in_use(UDP_PORT) and time.monotonic() < deadline:
++        time.sleep(0.1)
++    proc = subprocess.Popen(
++        [str(MINI_BINARY)],
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++        preexec_fn=os.setsid,
++    )
++    deadline = time.monotonic() + 5.0
++    while not _port_in_use(UDP_PORT) and time.monotonic() < deadline:
++        time.sleep(0.1)
++    backend = EsphomeBackend()
++    yield backend
++    backend.close()
++    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
++    proc.wait(timeout=5)
++
++
++def _scenario(backend) -> list[tuple[str, list[str]]]:
++    """One fixed script; returns every response with a label."""
++    out: list[tuple[str, list[str]]] = []
++
++    def step(label: str, fields: list[str]) -> None:
++        out.append((label, backend.poll(fields)))
++        backend.advance(1.0)
++
++    # Mixed fleet importing: Venus, a sensor mini (discharging 200 W) and a
++    # blind mini share the grid.
++    backend.battery_sensor(MINI_SENSOR, -200.0)
++    backend.set_grid(900.0)
++    for _ in range(3):
++        backend.battery_sensor(MINI_SENSOR, -200.0)
++        step("venus", _venus_poll(300))
++        step("sensor-mini", _mini_poll(MINI_SENSOR))
++        step("blind-mini", _mini_poll(MINI_BLIND))
++    # Big load: the blind mini is paced.
++    backend.set_grid(5000.0)
++    backend.battery_sensor(MINI_SENSOR, -200.0)
++    step("blind-mini paced", _mini_poll(MINI_BLIND))
++    # Export while every measured battery discharges: the blind mini is held.
++    backend.set_grid(-500.0)
++    backend.battery_sensor(MINI_SENSOR, -200.0)
++    step("venus export", _venus_poll(869))
++    backend.battery_sensor(MINI_SENSOR, -200.0)
++    step("blind-mini held", _mini_poll(MINI_BLIND))
++    # The sensor drops out: that mini falls back to the blind behaviour.
++    backend.battery_sensor(MINI_SENSOR, None)
++    backend.set_grid(300.0)
++    step("sensor-mini fallback", _mini_poll(MINI_SENSOR))
++    return out
++
++
++def test_mini_parity(esphome: EsphomeBackend) -> None:
++    python_out = _scenario(PythonBackend())
++    esphome_out = _scenario(esphome)
++    assert [label for label, _ in python_out] == [label for label, _ in esphome_out]
++    for (label, py), (_, esp) in zip(python_out, esphome_out, strict=True):
++        assert py == esp, f"{label}: python {py} != esphome {esp}"
++
++
++def test_mini_behaviour(esphome: EsphomeBackend) -> None:
++    responses = dict(_scenario(esphome))
++    blind = responses["blind-mini"]
++    assert blind[19] == "3"  # x_dchrg: 1/3 next to a Venus and a sensor mini
++    assert len(blind) == 28  # CT003
++    sensor = responses["sensor-mini"]
++    assert sensor[19] == "1"  # steered through its sensor, applies its own target
++    assert responses["blind-mini paced"][4] == "900"  # 300 W x 3 sharing
++    assert responses["blind-mini held"][4] == "0"  # never told to charge
++    assert responses["sensor-mini fallback"][4] == "300"  # raw grid again
+diff --git a/tests/data/addon_golden_settings.json b/tests/data/addon_golden_settings.json
+index e1470cb..b190859 100644
+--- a/tests/data/addon_golden_settings.json
++++ b/tests/data/addon_golden_settings.json
+@@ -3,6 +3,9 @@
+     "active_control": false,
+     "balance_deadband": 33,
+     "balance_gain": 0.44,
++    "battery_power_sensors": "ccc837b39dbe=sensor.mini_plug_power@A",
++    "battery_sensors_ha_token": "",
++    "battery_sensors_ha_url": "",
+     "cloud_reporting": true,
+     "cloud_reporting_host": "us.hamedata.com",
+     "cloud_reporting_interval": 45.0,
+@@ -92,9 +95,9 @@
+     "password": "s3cr3t",
+     "port": 1883,
+     "powermeter_health_interval": 30.0,
++    "state_throttle_interval": 0.0,
+     "tls": false,
+-    "username": "addons",
+-    "state_throttle_interval": 0.0
++    "username": "addons"
+   },
+   "mqtt_service": {
+     "host": "core-mosquitto",
+@@ -107,6 +110,7 @@
+     "active_control": false,
+     "balance_deadband": 33,
+     "balance_gain": 0.44,
++    "battery_power_sensors": "ccc837b39dbe=sensor.mini_plug_power@A",
+     "cloud_reporting": true,
+     "cloud_reporting_host": "us.hamedata.com",
+     "cloud_reporting_interval": 45,
+diff --git a/tests/test_ct002_venus_mini.py b/tests/test_ct002_venus_mini.py
+new file mode 100644
+index 0000000..5906557
+--- /dev/null
++++ b/tests/test_ct002_venus_mini.py
+@@ -0,0 +1,252 @@
++"""TEST PATCH: Venus E Mini (VNSEM) with and without a battery power sensor.
++
++A mini reports phase "0" and a 0/1 status instead of watts. Without a sensor
++it steers itself on 1/N of the grid; with one it is steered like any other
++battery.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import configparser
++
++import pytest
++from aiohttp import web
++
++from astrameter.config.config_loader import create_battery_source
++from astrameter.config.ini_config import IniAppConfig
++from astrameter.ct002.balancer import BalancerConfig
++from astrameter.ct002.battery_sensors import BatteryPowerSensors, parse_sources
++from astrameter.ct002.ct002 import CT002
++from astrameter.ct002.protocol import build_payload
++
++VENUS = "24215edb1931"
++MINI1 = "ccc837b39dbe"
++MINI2 = "aabbccddeeff"
++
++
++class _Transport:
++    def __init__(self) -> None:
++        self.sent: list[bytes] = []
++
++    def sendto(self, data: bytes, addr: tuple) -> None:
++        self.sent.append(data)
++
++
++def _ct(grid: float, **kwargs) -> CT002:
++    ct = CT002(
++        ct_type="HME-3",
++        ct_mac="02b2508b1d8e",
++        active_control=True,
++        dedupe_time_window=0.0,
++        # Steer on the reading itself, so the split is what the test sees.
++        balancer=BalancerConfig(grid_predict_trust=0.0),
++        **kwargs,
++    )
++
++    async def before_send(*_args, **_kwargs):
++        return [grid, 0.0, 0.0]
++
++    ct.before_send = before_send
++    return ct
++
++
++def _poll(ct: CT002, fields: list[str], ip: str) -> list[str]:
++    transport = _Transport()
++    asyncio.run(ct._handle_request(build_payload(fields), (ip, 22222), transport))
++    return transport.sent[-1][2:-2].decode().split("|")
++
++
++def _venus(ct: CT002, power: int) -> list[str]:
++    return _poll(
++        ct, ["HMG-50", VENUS, "HME-3", "02b2508b1d8e", "A", str(power)], "1.1.1.1"
++    )
++
++
++def _mini(ct: CT002, mac: str = MINI1, status: int = 1) -> list[str]:
++    return _poll(
++        ct, ["VNSEM-0", mac, "HME-3", "000000000000", "0", str(status)], "1.1.1.2"
++    )
++
++
++def _grid(fields: list[str]) -> int:
++    return int(fields[5])
++
++
++def _x_dchrg(fields: list[str]) -> int:
++    return int(fields[20])
++
++
++def _sensors(ct: CT002, readings: dict[str, float]) -> None:
++    """Feed battery-sensor readings (discharge positive) without any I/O."""
++    sensors = ct._power_sensors
++    assert sensors is not None
++    now = sensors._clock()
++    for mac, power in readings.items():
++        sensors._readings[mac] = (power, now)
++
++
++# --- only minis, no sensors: exactly like a real CT003 -----------------------
++
++
++def test_minis_alone_share_via_status_sum() -> None:
++    ct = _ct(800.0)
++    _mini(ct, MINI1)
++    fields = _mini(ct, MINI2)
++    assert _grid(fields) == 800  # raw grid, no clamp or pacing
++    assert _x_dchrg(fields) == 2  # two minis at work -> each takes 1/2
++    assert len(fields) - 1 == 28
++
++
++def test_idle_minis_count_nothing() -> None:
++    ct = _ct(800.0)
++    _mini(ct, MINI1, status=0)
++    fields = _mini(ct, MINI2, status=1)
++    assert _x_dchrg(fields) == 1
++
++
++# --- minis without sensors next to a Venus: 1/N each --------------------------
++
++
++def test_blind_minis_next_to_venus_take_one_nth() -> None:
++    ct = _ct(900.0)
++    _venus(ct, 300)
++    _mini(ct, MINI1)
++    fields = _mini(ct, MINI2)
++    assert _x_dchrg(fields) == 3  # Venus + two minis
++    _venus(ct, 300)
++    # The balancer only spreads the Venus' own third.
++    assert ct._balancer._diag_fair_share == pytest.approx(300.0)
++
++
++def test_blind_mini_never_pushed_against_venus() -> None:
++    ct = _ct(-500.0)  # export while the Venus discharges
++    _venus(ct, 869)
++    fields = _mini(ct)
++    assert _grid(fields) == 0  # the mini is not told to charge
++    _venus(ct, 869)
++    assert ct._balancer._diag_fair_share == pytest.approx(-500.0)  # Venus takes all
++
++
++def test_blind_mini_paced_next_to_venus() -> None:
++    ct = _ct(5000.0)
++    _venus(ct, 300)
++    fields = _mini(ct)
++    assert _x_dchrg(fields) == 2
++    assert _grid(fields) == 600  # MINI_MAX_STEP_W per sharing battery
++
++
++# --- minis with sensors: steered like a (big) Venus ---------------------------
++
++
++def test_sensor_mini_is_steered_like_a_venus() -> None:
++    ct = _ct(600.0, battery_power_sensors=f"{MINI1}=sensor.mini@B")
++    _sensors(ct, {MINI1: 250.0})
++    fields = _mini(ct)
++    consumer = ct._consumers[MINI1]
++    assert consumer.phase == "B"
++    assert consumer.power == 250
++    assert _x_dchrg(fields) == 1  # applies its own target in full
++    assert int(fields[6]) != 0  # its target sits on phase B
++
++
++def test_mixed_sensor_and_blind_minis() -> None:
++    ct = _ct(900.0, battery_power_sensors=f"{MINI1}=sensor.mini")
++    _sensors(ct, {MINI1: 200.0})
++    _venus(ct, 200)
++    _mini(ct, MINI1)  # steered through its sensor
++    blind = _mini(ct, MINI2)  # no sensor
++    assert _x_dchrg(blind) == 3  # 1/3 for the blind mini
++    _venus(ct, 200)
++    # Venus and the sensor mini split the remaining two thirds.
++    assert ct._balancer._diag_fair_share == pytest.approx(300.0)
++
++
++def test_sensor_mini_falls_back_when_stale() -> None:
++    ct = _ct(400.0, battery_power_sensors=f"{MINI1}=sensor.mini")
++    sensors = ct._power_sensors
++    assert sensors is not None
++    sensors._readings[MINI1] = (250.0, sensors._clock() - 60)  # old reading
++    fields = _mini(ct)
++    assert ct._consumers[MINI1].phase == "0"  # back to the blind behaviour
++    assert _x_dchrg(fields) == 1
++
++
++# --- configuration -------------------------------------------------------------
++
++
++def test_parse_sources() -> None:
++    sources = parse_sources(
++        "CC:C8:37:B3:9D:BE=-sensor.mini@b, aabbccddeeff=BATTERY_PLUG, "
++        "112233445566=x@Q, broken"
++    )
++    assert set(sources) == {"ccc837b39dbe", "aabbccddeeff"}
++    assert sources["ccc837b39dbe"].inverted
++    assert sources["ccc837b39dbe"].phase == "B"
++    assert sources["ccc837b39dbe"].is_entity
++    assert not sources["aabbccddeeff"].is_entity
++    assert sources["aabbccddeeff"].phase == "A"
++
++
++def _config(text: str) -> configparser.ConfigParser:
++    config = configparser.ConfigParser()
++    config.optionxform = str  # type: ignore[assignment,method-assign]
++    config.read_string(text)
++    return config
++
++
++def test_battery_source_section() -> None:
++    config = _config(
++        "[BATTERY_PLUG]\nSOURCE = JSON_HTTP\n"
++        "URL = http://192.168.1.50/api/v1/data\nJSON_PATHS = $.active_power_w\n"
++    )
++    meter = create_battery_source("BATTERY_PLUG", config)
++    assert type(meter).__name__ == "JsonHttpPowermeter"
++    assert IniAppConfig(config).battery_source("battery_plug") is not None
++
++
++def test_battery_source_refuses_grid_section_names() -> None:
++    config = _config("[SHELLY_MINI]\nSOURCE = SHELLY\nIP = 1.2.3.4\n")
++    assert create_battery_source("SHELLY_MINI", config) is None
++
++
++def test_battery_source_unknown_type() -> None:
++    config = _config("[BATTERY_X]\nSOURCE = NOPE\n")
++    assert create_battery_source("BATTERY_X", config) is None
++
++
++def test_section_source_reads_through_its_meter() -> None:
++    """End to end: a JSON_HTTP section feeding a mini's power."""
++
++    async def scenario() -> tuple[str, int]:
++        app = web.Application()
++
++        async def data(_request: web.Request) -> web.Response:
++            return web.json_response({"active_power_w": -285.0})
++
++        app.router.add_get("/api/v1/data", data)
++        runner = web.AppRunner(app)
++        await runner.setup()
++        site = web.TCPSite(runner, "127.0.0.1", 0)
++        await site.start()
++        port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
++        config = _config(
++            f"[BATTERY_PLUG]\nSOURCE = JSON_HTTP\n"
++            f"URL = http://127.0.0.1:{port}/api/v1/data\n"
++            f"JSON_PATHS = $.active_power_w\n"
++        )
++        sensors = BatteryPowerSensors(parse_sources(f"{MINI1}=BATTERY_PLUG@C"))
++        sensors.set_source_factory(IniAppConfig(config).battery_source)
++        await sensors.start()
++        for _ in range(30):
++            if sensors.power_for(MINI1) is not None:
++                break
++            await asyncio.sleep(0.1)
++        power = sensors.power_for(MINI1)
++        await sensors.stop()
++        await runner.cleanup()
++        return sensors.phase_for(MINI1), power  # type: ignore[return-value]
++
++    phase, power = asyncio.run(scenario())
++    assert phase == "C"
++    assert power == 285  # plug reads -285 (feeding in) -> discharging 285 W
+diff --git a/tests/test_ct_settings_wiring.py b/tests/test_ct_settings_wiring.py
+index d7bf07e..6e88c72 100644
+--- a/tests/test_ct_settings_wiring.py
++++ b/tests/test_ct_settings_wiring.py
+@@ -76,6 +76,9 @@ DESTINATIONS = {
+         _saturation(ct002)._stall_timeout_seconds
+     ),
+     "saturation_grace_seconds": lambda ct002: ct002._balancer._saturation_grace_seconds,
++    "battery_power_sensors": lambda ct002: ct002.battery_power_sensors,
++    "battery_sensors_ha_url": lambda ct002: ct002.battery_sensors_ha_url,
++    "battery_sensors_ha_token": lambda ct002: ct002.battery_sensors_ha_token,
+ }
+ 
+ 

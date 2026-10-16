@@ -70,6 +70,14 @@ constexpr double ADAPTIVE_TTL_POLL_MULTIPLIER = 2.0;
 constexpr double ADAPTIVE_TTL_MIN_SECONDS = 5.0;
 constexpr double ADAPTIVE_TTL_FALLBACK_SECONDS = 30.0;
 
+// TEST PATCH (Venus E Mini / VNSEM). How far a mini without a power sensor
+// may move per answer next to batteries with a known power, the output above
+// which such a battery counts as charging / discharging, and how old a
+// battery power sensor reading may be before it is ignored. Mirrors ct002.py.
+constexpr float MINI_MAX_STEP_W = 300.0f;
+constexpr float MINI_DIRECTION_W = 20.0f;
+constexpr double BATTERY_SENSOR_MAX_AGE_SECONDS = 5.0;
+
 // A run of this many consecutive nonzero sub-1 W readings on a phase whose
 // sensor declares no unit_of_measurement triggers a one-shot "input looks
 // like kW" log warning (issue #572). Real watt-denominated grid meters
@@ -168,6 +176,11 @@ class CT002Component : public Component {
   // referenced sensor declares a power unit_of_measurement (kW → 1000, etc.).
   // Declaring any unit — even "W" — also disables the runtime kW-suspicion
   // warning for that phase, since the user has stated their intent.
+  // TEST PATCH: a sensor measuring a battery that reports no usable power
+  // (Venus E Mini). Positive = the battery draws power (charging) unless
+  // invert is set. Phase is used for a battery that reports none.
+  void add_battery_power_sensor(const std::string &mac, sensor::Sensor *s,
+                                const std::string &phase, bool invert);
   void set_power_unit_scale(uint8_t idx, float scale) {
     this->unit_scale_[idx] = scale;
     this->unit_declared_[idx] = true;
@@ -432,6 +445,20 @@ class CT002Component : public Component {
   double now_seconds_() const;
   // (Re)constructs balancer_ from balancer_cfg_ + saturation_* members.
   void build_balancer_();
+
+  // TEST PATCH: battery power sensors (see add_battery_power_sensor).
+  struct BatteryPowerSensor {
+    std::string phase{"A"};
+    bool invert{false};
+    float watts{0.0f};  // battery power, discharge positive
+    double updated_at{-1.0};
+  };
+  std::unordered_map<std::string, BatteryPowerSensor> battery_power_sensors_;
+  // Measured power (discharge positive) for *mac*, if fresh.
+  std::optional<float> battery_sensor_power_(const std::string &mac) const;
+  static bool is_blind_mini_(const Consumer &c);
+  std::vector<const Consumer *> pool_() const;
+  static bool blind_blocked_(float grid_total, const std::vector<float> &steered);
 
   // Configuration.
   sensor::Sensor *power_sensor_l1_{nullptr};

@@ -142,6 +142,9 @@ def _build_ct002(
         saturation_stall_timeout_seconds=ct.saturation_stall_timeout_seconds,
         device_id=device_id,
         reset_fn=reset_fn,
+        battery_power_sensors=ct.battery_power_sensors,
+        battery_sensors_ha_url=ct.battery_sensors_ha_url,
+        battery_sensors_ha_token=ct.battery_sensors_ha_token,
     )
 
 
@@ -375,6 +378,8 @@ async def run_device(
     logger.debug("Starting device: %s", device_type)
     ct = config.ct(device_type) if is_ct(device_type) else None
     device = _build_device(device_type, ct, general, powermeters, device_id)
+    if isinstance(device, CT002):
+        device.set_battery_source_factory(config.battery_source)
     if insights:
         device.event_listener = _forward_events(insights, device)
 

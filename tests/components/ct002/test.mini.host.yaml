@@ -1,0 +1,46 @@
+# TEST PATCH: Venus E Mini scenarios (test_mini_e2e.py). Same control channel
+# as test.e2e.host.yaml, a CT003, and one mini with a battery power sensor.
+esphome:
+  name: ct002-mini-test
+
+host:
+
+logger:
+  level: DEBUG
+
+external_components:
+  - source:
+      type: local
+      path: ../../../esphome/components
+    components: [ct002]
+
+sensor:
+  - platform: template
+    id: grid_l1
+    update_interval: never
+  - platform: template
+    id: grid_l2
+    update_interval: never
+  - platform: template
+    id: grid_l3
+    update_interval: never
+  # Fed through the control channel (`battery_sensor <mac> <watts>`).
+  - platform: template
+    id: mini_power
+    update_interval: never
+
+ct002:
+  id: ct002_main
+  power_sensor_l1: grid_l1
+  power_sensor_l2: grid_l2
+  power_sensor_l3: grid_l3
+  ct_type: HME-3
+  udp_port: 12345
+  active_control: true
+  consumer_ttl: 100000s
+  dedupe_window: 0s
+  test_control_port: 12346
+  battery_power_sensors:
+    - mac: "cc:c8:37:b3:9d:be"
+      sensor: mini_power
+      phase: B

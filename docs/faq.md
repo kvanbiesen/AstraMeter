@@ -117,6 +117,22 @@ A: Use one of these device types:
 A: No, this project is Marstek-specific. For other brands, see
 [uni-meter](https://github.com/sdeigm/uni-meter).
 
+### Can I combine a Venus E Mini with a Venus E 2.0 or 3.0?
+
+Yes, with `DEVICE_TYPE = ct003`. A real CT003 can steer several minis or
+several Venus batteries, but it doesn't balance a mini against a Venus. The
+mini reports no power, so the CT can't tell what it is doing. AstraMeter gives
+a mini without a sensor 1/N of the grid and makes sure it never charges from
+the Venus, or the Venus from it. For proper balancing, put a smart plug in front
+of the mini and add it as a battery power sensor. See
+[Venus E Mini](ct002.md#venus-e-mini-vnsem).
+
+### My Venus E Mini shows as "unassigned". Is that a problem?
+
+No. A mini never reports a phase, also not to a real CT003. With a
+[battery power sensor](ct002.md#battery-power-sensors) it is shown on the phase
+you configure for it.
+
 ## Troubleshooting
 
 ### I get permission errors when binding to port 1010/2220.

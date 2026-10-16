@@ -3,6 +3,9 @@
     "active_control": false,
     "balance_deadband": 33,
     "balance_gain": 0.44,
+    "battery_power_sensors": "ccc837b39dbe=sensor.mini_plug_power@A",
+    "battery_sensors_ha_token": "",
+    "battery_sensors_ha_url": "",
     "cloud_reporting": true,
     "cloud_reporting_host": "us.hamedata.com",
     "cloud_reporting_interval": 45.0,
@@ -92,9 +95,9 @@
     "password": "s3cr3t",
     "port": 1883,
     "powermeter_health_interval": 30.0,
+    "state_throttle_interval": 0.0,
     "tls": false,
-    "username": "addons",
-    "state_throttle_interval": 0.0
+    "username": "addons"
   },
   "mqtt_service": {
     "host": "core-mosquitto",
@@ -107,6 +110,7 @@
     "active_control": false,
     "balance_deadband": 33,
     "balance_gain": 0.44,
+    "battery_power_sensors": "ccc837b39dbe=sensor.mini_plug_power@A",
     "cloud_reporting": true,
     "cloud_reporting_host": "us.hamedata.com",
     "cloud_reporting_interval": 45,

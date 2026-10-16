@@ -187,6 +187,13 @@ class CtSettings:
     efficiency_saturation_threshold: float = 0.4
     efficiency_demand_alpha: float = 0.1
     min_dc_output: float = 0.0
+    # TEST PATCH: "<battery mac>=[-]<entity id>[@A|B|C|D], ..." -- Home
+    # Assistant sensors measuring batteries that do not report their own
+    # power (Venus E Mini). Charging counts positive unless prefixed with "-".
+    battery_power_sensors: str = ""
+    # Home Assistant to read them from; empty inside the add-on.
+    battery_sensors_ha_url: str = ""
+    battery_sensors_ha_token: str = ""
 
 
 @dataclass(frozen=True)
@@ -242,6 +249,14 @@ class AppConfig(ABC):
         *general* is passed in (rather than read again) so command-line
         overrides applied to it also reach the power sources.
         """
+
+    def battery_source(self, name: str) -> Powermeter | None:
+        """TEST PATCH: the meter a battery-sensor section *name* describes.
+
+        Only a backend with config sections has any; the others return
+        ``None`` and battery sensors are then Home Assistant entities only.
+        """
+        return None
 
     def render_powermeters_ini(self) -> str:
         """The power-source sections of an equivalent ``config.ini``.

@@ -113,6 +113,16 @@ THROTTLE_INTERVAL = 0
 ## charges them. 0 disables it (default); 0-10000. Adjustable live from the
 ## dashboard or Home Assistant. Needs ACTIVE_CONTROL.
 # PEAKSHAVING_THRESHOLD = 0
+## --- Batteries that don't report their power (Venus E Mini) ---
+## A Venus E Mini reports neither its phase nor its power. Without a sensor it
+## takes an equal share (1/N) of the grid. With one it is steered like any other
+## battery. Format: <battery mac>=[-]<source>[@A|B|C|D], comma separated.
+## <source> is a section below (with a SOURCE key) or a Home Assistant entity.
+## The source counts charging as positive; "-" flips that. Phase defaults to A.
+# BATTERY_POWER_SENSORS = ccc837b39dbe=BATTERY_MINI_PLUG@A, aabbccddeeff=sensor.mini2_power
+## Only for Home Assistant entities, and only when not running as the add-on:
+# BATTERY_SENSORS_HA_URL = http://192.168.1.10:8123
+# BATTERY_SENSORS_HA_TOKEN = <long-lived access token>
 
 ## --- Fair distribution (multi-battery balancing) ---
 ## Adjust each battery's target so they share the load evenly.
@@ -628,3 +638,12 @@ THROTTLE_INTERVAL = 0
 ## Each configured powermeter section gets an "AstraMeter Powermeter <section>" device with an
 ## Online binary sensor that flips off when the source stops delivering fresh/usable readings.
 # POWERMETER_HEALTH_INTERVAL = 30
+
+## --- Battery power source (for BATTERY_POWER_SENSORS) ---
+## SOURCE names a power meter type; the other keys are that type's usual keys.
+## The section name must NOT start with a meter type (SHELLY_..., TASMOTA_...),
+## or it would also be read as a grid meter.
+#[BATTERY_MINI_PLUG]
+#SOURCE = JSON_HTTP
+#URL = http://192.168.1.50/api/v1/data
+#JSON_PATHS = $.active_power_w

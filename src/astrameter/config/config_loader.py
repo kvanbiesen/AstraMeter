@@ -915,6 +915,40 @@ def create_powermeter(
     return None
 
 
+def powermeter_prefix(section: str) -> str | None:
+    """The power meter type a section name selects, if any."""
+    for prefix, _factory in _FACTORIES:
+        if section.startswith(prefix):
+            return prefix
+    return None
+
+
+def create_battery_source(
+    section: str, config: configparser.ConfigParser
+) -> Powermeter | None:
+    """TEST PATCH: the power meter a battery-sensor section describes.
+
+    The section's ``SOURCE`` key names the meter type; every other key is that
+    type's usual one. Its name must not start with a meter type, or the grid
+    reader would pick it up as a power source as well.
+    """
+    if powermeter_prefix(section) is not None:
+        logger.error(
+            "Section [%s] is read as a grid power source; give the battery "
+            "sensor a name that does not start with a meter type, e.g. "
+            "[BATTERY_%s]",
+            section,
+            section,
+        )
+        return None
+    source = config.get(section, "SOURCE", fallback="").strip().upper()
+    for prefix, factory in _FACTORIES:
+        if source == prefix and factory is not None:
+            return factory(section, config)
+    logger.error("Section [%s]: SOURCE = %r is not a power meter type", section, source)
+    return None
+
+
 def read_mqtt_insights_config(
     config: configparser.ConfigParser,
 ) -> MqttInsightsConfig | None:

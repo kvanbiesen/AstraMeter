@@ -2,6 +2,10 @@
 
 ## Next
 
+- **Added** steering for the Marstek Venus E Mini next to other batteries. A mini without a sensor takes an equal share of the grid; it is never steered against another battery, so they can't charge each other, and it is paced so it doesn't run ahead of a slower Venus. Several minis keep sharing the way they do on a real CT003. See [Venus E Mini](docs/ct002.md#venus-e-mini-vnsem).
+
+- **Added** `BATTERY_POWER_SENSORS` (add-on: **Battery Power Sensors**; ESPHome: `battery_power_sensors`) for batteries that don't report their own power, such as the Venus E Mini. Give it a smart plug in front of the battery, a Home Assistant sensor or any other power source, and the battery is steered like any other, with fair distribution and saturation detection. See [Battery power sensors](docs/ct002.md#battery-power-sensors).
+
 - **Fixed** a Marstek Venus E Mini failing to pair with the emulated CT ("configuration failed" in the app) when `CT_MAC` is set, and a `CT_MAC` entered in uppercase or with colons never pairing ([#727](https://github.com/tomquist/astrameter/pull/727), [#728](https://github.com/tomquist/astrameter/pull/728)).
 
 - **Fixed** a battery's Home Assistant entities staying unavailable until a restart since 2.3.1, after a network hiccup briefly dropped the battery and the MQTT connection at the same time ([#718](https://github.com/tomquist/astrameter/issues/718), [#719](https://github.com/tomquist/astrameter/pull/719)).

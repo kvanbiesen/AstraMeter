@@ -76,6 +76,9 @@ DESTINATIONS = {
         _saturation(ct002)._stall_timeout_seconds
     ),
     "saturation_grace_seconds": lambda ct002: ct002._balancer._saturation_grace_seconds,
+    "battery_power_sensors": lambda ct002: ct002.battery_power_sensors,
+    "battery_sensors_ha_url": lambda ct002: ct002.battery_sensors_ha_url,
+    "battery_sensors_ha_token": lambda ct002: ct002.battery_sensors_ha_token,
 }
 
 

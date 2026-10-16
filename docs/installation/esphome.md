@@ -70,6 +70,84 @@ Optional sub-blocks nest under the same `ct002:` key:
   `http_request:` block. Add `mqtt_insights:` too and the App-topic subscription
   picks up the MAC on its own — no reboot needed.
 
+## Venus E Mini
+
+Set `ct_type: HME-3` (CT003) when a Venus E Mini polls the ESP32: it expects
+the CT003's 28-field answer. It works without anything else, the same way it
+does with AstraMeter on a server. Without a sensor a mini takes 1/N of the
+grid, never steered against another battery and paced. See
+[Venus E Mini](../ct002.md#venus-e-mini-vnsem).
+
+### Battery power sensors
+
+Give a mini a sensor that measures its power and it is steered like any other
+battery. Any ESPHome sensor works, so no Home Assistant is needed: an
+`http_request` poll of a smart plug, an `mqtt_subscribe` sensor, a
+`homeassistant` sensor, or a power-metering chip wired to the ESP32 itself.
+
+```yaml
+ct002:
+  power_sensor_l1: grid_l1
+  ct_type: HME-3
+  battery_power_sensors:
+    - mac: ccc837b39dbe       # the mini's MAC as it polls the CT
+      sensor: mini_power      # positive while the mini charges
+      phase: A                # optional, default A
+      invert: false           # optional: true if discharge is positive
+    - mac: aabbccddeeff       # a second mini, one entry each
+      sensor: mini2_power
+```
+
+| Key | Required | Meaning |
+|---|---|---|
+| `mac` | yes | The battery's MAC, 12 hex digits (colons allowed). |
+| `sensor` | yes | An ESPHome sensor in watts. Charging counts as positive. |
+| `phase` | no | `A`, `B`, `C` or `D` (combined): the phase it is steered on. Default `A`. |
+| `invert` | no | `true` if the sensor counts discharging as positive. Default `false`. |
+
+The sensor should update about once a second. A reading older than 5 s is
+ignored, and the mini falls back to 1/N until fresh readings return. A sensor
+that goes `NaN` (unavailable) counts as no reading.
+
+Example: a HomeWizard Energy Socket in front of the mini (Local API enabled),
+polled every second:
+
+```yaml
+http_request:
+  timeout: 2s
+
+sensor:
+  - platform: template
+    id: mini_power
+    unit_of_measurement: W
+    update_interval: never
+
+interval:
+  - interval: 1s
+    then:
+      - http_request.get:
+          url: http://192.168.1.50/api/v1/data
+          capture_response: true
+          max_response_buffer_size: 1024
+          on_response:
+            then:
+              - lambda: |-
+                  json::parse_json(body, [](JsonObject root) -> bool {
+                    id(mini_power).publish_state(root["active_power_w"].as<float>());
+                    return true;
+                  });
+```
+
+Or from an MQTT topic (the `mqtt:` block must be configured):
+
+```yaml
+sensor:
+  - platform: mqtt_subscribe
+    id: mini_power
+    topic: plugs/mini/power
+    unit_of_measurement: W
+```
+
 ## Status & requirements
 
 **Status:** experimental — the UDP emulator, balancer, filter pipeline,

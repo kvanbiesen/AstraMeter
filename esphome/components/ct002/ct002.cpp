@@ -313,7 +313,8 @@ void CT002Component::handle_request_(const uint8_t *data, size_t len,
     ESP_LOGD(TAG, "Invalid CT002 request from %s: %s", addr_ip.c_str(), error.c_str());
     return;
   }
-  const auto &fields = *parsed;
+  // Mutable: a battery power sensor may replace the reported phase/power.
+  auto fields = *parsed;
   if (fields.size() < 4) return;
   if (!this->validate_ct_mac_(fields)) return;
 
@@ -331,13 +332,29 @@ void CT002Component::handle_request_(const uint8_t *data, size_t len,
   // is combined / whole-home mode (newer Marstek firmware) — all four are
   // valid, actively-steered phases, so they are NOT inspection. Mirrors
   // ct002.py _handle_request.
-  const bool in_inspection_mode = !is_steered_phase(reported_phase);
   int reported_power = 0;
   if (fields.size() > 5) {
     // Match Python's parse_int (int()): reject trailing garbage / float
     // syntax instead of strtol's lenient prefix parse.
     reported_power = parse_int_strict(fields[5], 0);
   }
+  // TEST PATCH: a battery with a power sensor is steered like any other: its
+  // measured power replaces the report, and a battery that reports no phase
+  // (the Venus E Mini) is placed on its configured phase. Mirrors ct002.py.
+  if (!this->battery_power_sensors_.empty()) {
+    std::string mac = fields[1];
+    for (auto &c : mac) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const auto measured = this->battery_sensor_power_(mac);
+    if (measured.has_value()) {
+      reported_power = static_cast<int>(round_half_even(static_cast<double>(*measured)));
+      if (!is_steered_phase(reported_phase))
+        reported_phase = this->battery_power_sensors_.at(mac).phase;
+      while (fields.size() < 6) fields.emplace_back();
+      fields[4] = reported_phase;
+      fields[5] = std::to_string(reported_power);
+    }
+  }
+  const bool in_inspection_mode = !is_steered_phase(reported_phase);
   // Optional 7th field: "participate" flag (newer senders, e.g. B2500).
   // Absent/empty defaults to participating; an explicit 0 opts out.
   bool participates = true;
@@ -754,8 +771,37 @@ std::vector<float> CT002Component::compute_smooth_target_(const std::vector<floa
   // as the device-level smooth_target sensor.
   this->last_smooth_target_ = grid_total;
   const auto shaved = this->peakshaving_(grid_total);
-  auto out_arr = this->balancer_->compute_target(consumer_id, mode, reports, shaved.first,
-                                                 inactive, manual, values, shaved.second);
+  // TEST PATCH (Venus E Mini): minis without a power sensor steer themselves
+  // on 1/N of the grid (see the x bucket in the response). Leave them out of
+  // the balancer, which only spreads the remaining share over the batteries
+  // whose power it can see -- unless they cannot act on this correction, in
+  // which case the others take all of it. Mirrors ct002.py.
+  float balancer_total = shaved.first;
+  std::vector<float> sample_id = values;
+  {
+    std::vector<std::string> blind;
+    std::vector<float> steered;
+    for (const Consumer *c : this->pool_()) {
+      if (is_blind_mini_(*c))
+        blind.push_back(c->consumer_id);
+      else
+        steered.push_back(c->power);
+    }
+    if (!blind.empty() && !steered.empty()) {
+      for (const auto &id : blind) inactive.insert(id);
+      const bool blocked = blind_blocked_(balancer_total, steered);
+      if (!blocked) {
+        balancer_total = balancer_total * static_cast<float>(steered.size()) /
+                         static_cast<float>(steered.size() + blind.size());
+      }
+      // The balancer caches per reading; a different split is a different sample.
+      sample_id.push_back(static_cast<float>(blind.size()));
+      sample_id.push_back(static_cast<float>(steered.size()));
+      sample_id.push_back(blocked ? 1.0f : 0.0f);
+    }
+  }
+  auto out_arr = this->balancer_->compute_target(consumer_id, mode, reports, balancer_total,
+                                                 inactive, manual, sample_id, shaved.second);
   for (size_t i = 0; i < 3; ++i) this->last_target_[i] = out_arr[i];
   return {out_arr[0], out_arr[1], out_arr[2]};
 }
@@ -860,7 +906,73 @@ std::vector<std::string> CT002Component::build_response_fields_(
   fields[18] = to_int_str(phase_reports.chrg_power[BUCKET_ABC]);
   fields[23] = to_int_str(phase_reports.dchrg_power[BUCKET_ABC]);
 
+  // TEST PATCH (Venus E Mini / VNSEM). Mirrors ct002.py.
+  std::string dev_upper = meter_dev_type;
+  for (auto &c : dev_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  const bool is_mini = dev_upper.rfind("VNSEM", 0) == 0;
+  if (this->active_control_ && is_mini) {
+    std::string mac = meter_mac;
+    for (auto &c : mac) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const bool has_sensor = this->battery_sensor_power_(mac).has_value();
+    if (has_sensor) {
+      // Steered through its power sensor: it gets its own target, so tell it
+      // it is alone and it applies that target in full.
+      fields[14] = "0";
+      fields[19] = "1";
+    } else if (!is_steered_phase(reported_phase)) {
+      // Without a power sensor it reports phase "0" and a status of 0/1
+      // instead of watts. A real CT003 only sums that status into the x
+      // bucket, so x_dchrg_power is the number of minis at work and each mini
+      // takes that share. Alone with other minis we do exactly that. Next to
+      // batteries with a known power it is told how many share in total
+      // (1/N), is never pushed against them, and is paced.
+      const auto pool = this->pool_();
+      std::vector<float> steered;
+      for (const Consumer *c : pool)
+        if (!is_blind_mini_(*c)) steered.push_back(c->power);
+      long x_chrg = 0;
+      long x_dchrg = 0;
+      float lo = -INFINITY;
+      float hi = INFINITY;
+      if (steered.empty()) {
+        for (const Consumer *c : pool) {
+          const long status = round_half_even(static_cast<double>(c->power));
+          if (status < 0) x_chrg += status;
+          if (status > 0) x_dchrg += status;
+        }
+      } else {
+        const long sharing = std::max<long>(1, static_cast<long>(pool.size()));
+        x_dchrg = sharing;
+        const float cap = MINI_MAX_STEP_W * static_cast<float>(sharing);
+        lo = -cap;
+        hi = cap;
+        if (std::all_of(steered.begin(), steered.end(),
+                        [](float p) { return p > MINI_DIRECTION_W; })) {
+          lo = 0.0f;
+        } else if (std::all_of(steered.begin(), steered.end(),
+                               [](float p) { return p < -MINI_DIRECTION_W; })) {
+          hi = 0.0f;
+        }
+      }
+      fields[14] = std::to_string(x_chrg);
+      fields[19] = std::to_string(x_dchrg);
+      long sum = 0;
+      for (size_t i = 0; i < 3; ++i) {
+        const float clamped = std::min(hi, std::max(lo, phase_power[i]));
+        const long rounded = round_half_even(static_cast<double>(clamped));
+        fields[4 + i] = std::to_string(rounded);
+        sum += rounded;
+      }
+      fields[7] = std::to_string(sum);
+    }
+  }
+
   while (fields.size() < RESPONSE_LABEL_COUNT) fields.push_back("0");
+  // TEST PATCH: a real CT003 (HME-3) answers with 28 fields, appending its
+  // four cumulative energy registers (off-peak/peak import/export).
+  if (this->ct_type_ == "HME-3") {
+    for (int i = 0; i < 4; ++i) fields.push_back("0");
+  }
   this->info_idx_counter_ = (this->info_idx_counter_ + 1) % 256;
   return fields;
 }
@@ -1109,6 +1221,64 @@ bool CT002Component::dedup_should_process_(const std::string &consumer_id) {
   }
   this->dedup_last_[consumer_id] = now;
   return true;
+}
+
+// --- TEST PATCH: Venus E Mini / battery power sensors (mirrors ct002.py) ---
+
+void CT002Component::add_battery_power_sensor(const std::string &mac, sensor::Sensor *s,
+                                              const std::string &phase, bool invert) {
+  BatteryPowerSensor entry;
+  entry.phase = phase.empty() ? "A" : phase;
+  entry.invert = invert;
+  this->battery_power_sensors_[mac] = entry;
+  if (s == nullptr) return;
+  s->add_on_state_callback([this, mac](float value) {
+    auto it = this->battery_power_sensors_.find(mac);
+    if (it == this->battery_power_sensors_.end()) return;
+    if (!std::isfinite(value)) {
+      it->second.updated_at = -1.0;
+      return;
+    }
+    // The sensor counts charging as positive; the balancer counts discharge
+    // as positive.
+    it->second.watts = it->second.invert ? value : -value;
+    it->second.updated_at = this->now_seconds_();
+  });
+}
+
+std::optional<float> CT002Component::battery_sensor_power_(const std::string &mac) const {
+  auto it = this->battery_power_sensors_.find(mac);
+  if (it == this->battery_power_sensors_.end()) return std::nullopt;
+  if (it->second.updated_at < 0.0) return std::nullopt;
+  if (this->now_seconds_() - it->second.updated_at > BATTERY_SENSOR_MAX_AGE_SECONDS)
+    return std::nullopt;
+  return it->second.watts;
+}
+
+bool CT002Component::is_blind_mini_(const Consumer &c) {
+  std::string dev = c.device_type;
+  for (auto &ch : dev) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  return dev.rfind("VNSEM", 0) == 0 && normalize_phase(c.phase) == "0";
+}
+
+std::vector<const Consumer *> CT002Component::pool_() const {
+  std::vector<const Consumer *> out;
+  const double now = this->now_seconds_();
+  for (const auto &kv : this->consumers_) {
+    const Consumer &c = kv.second;
+    if (c.timestamp > 0.0 && c.active && c.participates && !this->consumer_expired_(c, now))
+      out.push_back(&c);
+  }
+  return out;
+}
+
+bool CT002Component::blind_blocked_(float grid_total, const std::vector<float> &steered) {
+  if (steered.empty()) return false;
+  const bool all_dchrg = std::all_of(steered.begin(), steered.end(),
+                                     [](float p) { return p > MINI_DIRECTION_W; });
+  const bool all_chrg = std::all_of(steered.begin(), steered.end(),
+                                    [](float p) { return p < -MINI_DIRECTION_W; });
+  return (grid_total < 0.0f && all_dchrg) || (grid_total > 0.0f && all_chrg);
 }
 
 void CT002Component::force_balancer_rotation() {

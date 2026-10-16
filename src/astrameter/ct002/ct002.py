@@ -28,6 +28,7 @@ from .balancer import (
     device_capabilities,
     phase_index,
 )
+from .battery_sensors import BatteryPowerSensors
 from .protocol import (
     ETX,
     RESPONSE_LABELS,
@@ -81,6 +82,11 @@ PEAKSHAVING_IDLE_BAND_W = 100.0
 # unassigned/inspection ("0") reporters and ``ABC`` for combined-mode
 # (phase "D") reporters.
 PHASE_BUCKETS = ("x", "A", "B", "C", "ABC")
+
+# TEST PATCH (Venus E Mini): how far the mini may move per answer, and the
+# output above which another battery counts as charging / discharging.
+MINI_MAX_STEP_W = 300
+MINI_DIRECTION_W = 20
 
 # Default eviction policy (``consumer_ttl=None``): the real CT clears a slave
 # slot that missed roughly 1-2 of its own poll cycles, so by default a
@@ -470,7 +476,17 @@ class CT002:
         device_id: str = "",
         clock: Callable[[], float] | None = None,
         reset_fn: Callable[[], None] | None = None,
+        battery_power_sensors: str = "",
+        battery_sensors_ha_url: str = "",
+        battery_sensors_ha_token: str = "",
     ) -> None:
+        # TEST PATCH: measured power for batteries that do not report it.
+        self.battery_power_sensors = battery_power_sensors
+        self.battery_sensors_ha_url = battery_sensors_ha_url
+        self.battery_sensors_ha_token = battery_sensors_ha_token
+        self._power_sensors = BatteryPowerSensors.from_settings(
+            battery_power_sensors, battery_sensors_ha_url, battery_sensors_ha_token
+        )
         self.udp_port = udp_port
         self.ct_mac = normalize_ct_mac(ct_mac)
         self.ct_type = ct_type
@@ -945,6 +961,21 @@ class CT002:
             for cid, c in self._consumers.items()
             if not c.active or not c.participates
         )
+        # TEST PATCH (Venus E Mini): minis without a power sensor steer
+        # themselves on 1/N of the grid (see the x bucket in the response).
+        # Leave them out of the balancer, which only spreads the remaining
+        # share over the batteries whose power it can see -- unless they cannot
+        # act on this correction, in which case the others take all of it.
+        blind = self._blind_minis()
+        steered = self._steered_powers()
+        if blind and steered:
+            inactive |= frozenset(blind)
+            blocked = self._blind_blocked(total, steered)
+            if not blocked:
+                total = total * len(steered) / (len(steered) + len(blind))
+            # The balancer caches per reading; a different split is a
+            # different sample.
+            sample_id = (*sample_id, len(blind), len(steered), blocked)
         manual = frozenset(
             cid for cid, c in self._consumers.items() if c.manual_enabled
         )
@@ -958,6 +989,52 @@ class CT002:
             manual,
             sample_id,
             hold_at_zero=hold_at_zero,
+        )
+
+    @staticmethod
+    def _is_blind_mini(c: Consumer) -> bool:
+        """A Venus E Mini without a power sensor: no phase, no real power."""
+        return str(c.device_type).upper().startswith("VNSEM") and (
+            normalize_phase(c.phase) == "0"
+        )
+
+    def _pool(self) -> list[Consumer]:
+        """Batteries currently polling and taking part (TEST PATCH)."""
+        now = self._clock()
+        return [
+            c
+            for c in self._consumers.values()
+            if c.timestamp > 0
+            and c.active
+            and c.participates
+            and not self._consumer_expired(c, now)
+        ]
+
+    def _blind_minis(self) -> list[str]:
+        """Active minis without a power sensor (TEST PATCH)."""
+        pool = {id(c) for c in self._pool()}
+        return [
+            cid
+            for cid, c in self._consumers.items()
+            if id(c) in pool and self._is_blind_mini(c)
+        ]
+
+    def _steered_powers(self) -> list[int]:
+        """Reported power of the active batteries the balancer can see."""
+        return [c.power for c in self._pool() if not self._is_blind_mini(c)]
+
+    @staticmethod
+    def _blind_blocked(grid_total: float, steered: list[int]) -> bool:
+        """Whether a sensorless mini is kept out of this correction.
+
+        It is never shown export while all the measured batteries discharge,
+        nor import while they all charge, so the two cannot end up pushing
+        energy into each other.
+        """
+        if not steered:
+            return False
+        return (grid_total < 0 and all(p > MINI_DIRECTION_W for p in steered)) or (
+            grid_total > 0 and all(p < -MINI_DIRECTION_W for p in steered)
         )
 
     def _collect_reports_by_phase(self) -> dict[str, PhaseBucket]:
@@ -1271,7 +1348,59 @@ class CT002:
         response_fields[18] = str(abc.chrg_power)
         response_fields[23] = str(abc.dchrg_power)
 
+        # TEST PATCH (Venus E Mini / VNSEM) without a power sensor: it reports
+        # phase "0" and a status of 0/1 instead of watts. A real CT003 counts
+        # such reporters in no *_chrg_nb field; it only sums their status into
+        # the x bucket, so x_dchrg_power is the number of minis at work, and
+        # each mini takes that share of the grid. Alone with other minis we do
+        # exactly that. Next to batteries with a known power, the mini is told
+        # how many batteries share in total (1/N), is never pushed against
+        # them, and is paced so it does not run ahead of them.
+        if (
+            self.active_control
+            and request.in_inspection_mode
+            and request.meter_dev_type.upper().startswith("VNSEM")
+        ):
+            pool = self._pool()
+            steered = [c.power for c in pool if not self._is_blind_mini(c)]
+            if not steered:
+                statuses = [parse_int(c.power, 0) for c in pool]
+                x_chrg = sum(v for v in statuses if v < 0)
+                x_dchrg = sum(v for v in statuses if v > 0)
+                lo, hi = -math.inf, math.inf
+            else:
+                sharing = max(1, len(pool))
+                x_chrg, x_dchrg = 0, sharing
+                cap = MINI_MAX_STEP_W * sharing
+                lo, hi = -cap, cap
+                if all(p > MINI_DIRECTION_W for p in steered):
+                    lo = 0
+                elif all(p < -MINI_DIRECTION_W for p in steered):
+                    hi = 0
+            response_fields[14] = str(x_chrg)
+            response_fields[19] = str(x_dchrg)
+            for idx in (4, 5, 6):
+                value = parse_int(response_fields[idx], 0)
+                response_fields[idx] = str(round(min(hi, max(lo, value))))
+            response_fields[7] = str(
+                sum(parse_int(response_fields[idx], 0) for idx in (4, 5, 6))
+            )
+
+        # TEST PATCH: a mini steered through its power sensor gets its own
+        # target; tell it it is alone so it applies that target in full.
+        if (
+            self.active_control
+            and not request.in_inspection_mode
+            and request.meter_dev_type.upper().startswith("VNSEM")
+        ):
+            response_fields[14] = "0"
+            response_fields[19] = "1"
+
         response_fields += ["0"] * (len(RESPONSE_LABELS) - len(response_fields))
+        # TEST PATCH: a real CT003 (HME-3) answers with 28 fields, appending its
+        # four cumulative energy registers (off-peak/peak import/export).
+        if self.ct_type == "HME-3":
+            response_fields += ["0", "0", "0", "0"]
         self._info_idx_counter = (self._info_idx_counter + 1) % 256
         return response_fields
 
@@ -1432,6 +1561,21 @@ class CT002:
             return None
 
         request = CT002Request.from_fields(fields, addr)
+        # TEST PATCH: a battery with a power sensor is steered like any other:
+        # its measured power replaces the report, and a battery that reports
+        # no phase (the Venus E Mini) is placed on its configured phase.
+        if self._power_sensors is not None:
+            measured = self._power_sensors.power_for(request.meter_mac)
+            if measured is not None:
+                request = dataclasses.replace(
+                    request,
+                    power=measured,
+                    phase=(
+                        self._power_sensors.phase_for(request.meter_mac)
+                        if request.in_inspection_mode
+                        else request.phase
+                    ),
+                )
         if not self._ct_mac_matches(request):
             logger.debug(
                 "Ignoring CT002 request from %s due to CT MAC mismatch (req=%s, cfg=%s)",
@@ -1695,6 +1839,11 @@ class CT002:
         except asyncio.CancelledError:
             pass
 
+    def set_battery_source_factory(self, factory: Callable[[str], Any] | None) -> None:
+        """TEST PATCH: how battery-sensor section names become meters."""
+        if self._power_sensors is not None:
+            self._power_sensors.set_source_factory(factory)
+
     async def start(self) -> None:
         self._server = await UdpServer.serve(self.udp_port, self._safe_handle_request)
         # Read the bound port back: a configured 0 asks the OS to pick one, and
@@ -1702,6 +1851,8 @@ class CT002:
         self.udp_port = self._server.port or self.udp_port
         self._stopped.clear()
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        if self._power_sensors is not None:
+            await self._power_sensors.start()
         self._started_at = self._clock()
         self._running = True
         self._rev += 1
@@ -1711,6 +1862,8 @@ class CT002:
         await self._stopped.wait()
 
     async def stop(self) -> None:
+        if self._power_sensors is not None:
+            await self._power_sensors.stop()
         if self._cleanup_task:
             self._cleanup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

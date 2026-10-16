@@ -32,6 +32,9 @@ configuration:
   peakshaving_threshold:
     name: Peak Shaving Threshold
     description: "For tariffs that bill on peak demand (e.g. the Belgian capacity tariff): the batteries only cover net household demand above this many watts. Below it they stay idle instead of covering everyday load, while solar surplus still charges them. Set to 0 to disable (default); up to 10000. Also adjustable live from the dashboard or Home Assistant. Only applies to CT002/CT003 device types with active control."
+  battery_power_sensors:
+    name: Battery Power Sensors
+    description: "Optional. For batteries that do not report their own power, such as the Marstek Venus E Mini: a Home Assistant sensor that measures each one (a smart plug in front of it, for example), so it is steered like any other battery. Format: <battery MAC>=<sensor entity>[@phase], comma separated, e.g. 'ccc837b39dbe=sensor.mini_plug_power@A'. The sensor counts charging as positive; put '-' before the entity if yours counts discharging as positive. The phase (A, B, C or D) defaults to A. It should update about once a second. A Venus E Mini without a sensor still works: it takes an equal share of the grid. Only applies to CT002/CT003 device types with active control."
   min_efficient_power:
     name: Min Efficient Power
     description: "Minimum watts each active battery should handle. At low demand, excess batteries are idled so the remaining ones stay above this threshold and operate more efficiently. Set to 0 to disable (default). Example: 2 batteries, 200 W demand, threshold 150 — one battery gets 200 W, the other idles. Only applies to CT002/CT003 device types."

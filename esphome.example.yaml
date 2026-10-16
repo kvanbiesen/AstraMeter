@@ -111,6 +111,11 @@ ct002:
   #                                # poll rate (~2 missed polls, like the real CT)
   # dedupe_window: 0s              # 0 = off; >0 drops duplicate polls from the
   #                                # same battery within the window
+  # battery_power_sensors:         # Venus E Mini: it doesn't report its power.
+  #   - mac: ccc837b39dbe          # Without an entry it takes 1/N of the grid;
+  #     sensor: mini_power         # with one it is steered like any battery.
+  #     phase: A                   # Any ESPHome sensor in W, charging positive
+  #     invert: false              # (invert: true if discharge is positive).
 
   # ── Optional tuning blocks ──────────────────────────────────────────
   # Everything below is optional and shown prepopulated with values that

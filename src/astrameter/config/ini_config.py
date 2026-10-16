@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from astrameter.config.config_loader import (
     GENERAL_KEY_OVERRIDES,
     SIGNAL_KEY_OVERRIDES,
+    create_battery_source,
     general_key,
     ini_key,
     new_config_parser,
@@ -35,6 +36,7 @@ from astrameter.config.settings import (
 if TYPE_CHECKING:
     from astrameter.config.settings import ConfiguredPowermeter
     from astrameter.mqtt_insights import MqttInsightsConfig
+    from astrameter.powermeter import Powermeter
 
 GENERAL_SECTION = "GENERAL"
 MARSTEK_SECTION = "MARSTEK"
@@ -129,6 +131,14 @@ class IniAppConfig(AppConfig):
 
     def powermeters(self, general: GeneralSettings) -> list[ConfiguredPowermeter]:
         return read_all_powermeter_configs(self._config, general.signal)
+
+    def battery_source(self, name: str) -> Powermeter | None:
+        """TEST PATCH: build the meter section *name* (any case) describes."""
+        wanted = name.strip().upper()
+        for section in self._config.sections():
+            if section.upper() == wanted:
+                return create_battery_source(section, self._config)
+        return None
 
 
 # Rendering settings back into a ``config.ini`` is what lets the dashboard hand

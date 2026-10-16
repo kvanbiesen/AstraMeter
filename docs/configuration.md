@@ -15,7 +15,9 @@ that apply to the whole app and to every powermeter. For one specific area, see:
 - **[Powermeter sources](powermeters.md)** — the `config.ini` section for each
   supported meter (Shelly, Tasmota, MQTT, Home Assistant, SMA, HomeWizard, …).
 - **[CT002 / CT003 steering](ct002.md)** — the CT emulator, active control,
-  multi-battery balancing, and efficiency optimization.
+  multi-battery balancing, and efficiency optimization, including the
+  [Venus E Mini](ct002.md#venus-e-mini-vnsem) and
+  [battery power sensors](ct002.md#battery-power-sensors).
 - **[MQTT Insights & Home Assistant entities](mqtt-insights.md)** — publishing
   internal state to MQTT, HA Device Discovery, and per-battery controls.
 - **[ESPHome powermeter sources](esphome-powermeters.md)** — the equivalent

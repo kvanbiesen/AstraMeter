@@ -29,6 +29,7 @@
 #ifdef USE_CT002_TEST_HOOKS
 
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -144,6 +145,34 @@ void CT002Component::handle_control_command_(const std::string &cmd,
       reply = std::string("ok cfg ") + key;
     } else {
       reply = "err cfg (bad key or parse)";
+    }
+    this->control_socket_->sendto(reply.data(), reply.size(), 0,
+                                  reinterpret_cast<const struct sockaddr *>(&from), from_len);
+    return;
+  }
+
+  // TEST PATCH: `battery_sensor <mac> <watts>` publishes a battery power
+  // sensor reading (sensor convention: charging positive) stamped "now";
+  // `battery_sensor <mac> nan` makes it unavailable.
+  if (cmd.rfind("battery_sensor ", 0) == 0) {
+    char mac[48] = {0};
+    char raw[32] = {0};
+    if (std::sscanf(cmd.c_str() + 15, "%47s %31s", mac, raw) == 2) {
+      auto it = this->battery_power_sensors_.find(mac);
+      if (it != this->battery_power_sensors_.end()) {
+        const double value = std::strtod(raw, nullptr);
+        if (std::isfinite(value)) {
+          it->second.watts = static_cast<float>(it->second.invert ? value : -value);
+          it->second.updated_at = this->now_seconds_();
+        } else {
+          it->second.updated_at = -1.0;
+        }
+        reply = std::string("ok battery_sensor ") + mac;
+      } else {
+        reply = "err battery_sensor (unknown mac)";
+      }
+    } else {
+      reply = "err battery_sensor (parse)";
     }
     this->control_socket_->sendto(reply.data(), reply.size(), 0,
                                   reinterpret_cast<const struct sockaddr *>(&from), from_len);
