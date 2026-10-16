@@ -14,3 +14,4 @@ coverage.xml
 config.ini
 .DS_Store
 tools/.membench/
+astrameter-mini-sensors.patch

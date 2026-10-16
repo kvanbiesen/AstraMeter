@@ -1,6 +1,6 @@
-name: "AstraMeter"
-url: "https://github.com/tomquist/astrameter"
-maintainer: "Tom Quist <tomquist@users.noreply.github.com>"
+name: "AstraMeter (Custom Fork)"
+url: "https://github.com/kvanbiesen/astrameter"
+maintainer: "SadisticPandaBear <kvanbiesen@users.noreply.github.com>"
 addons:
   b2500_meter:
     repository: ha_addon
